@@ -103,5 +103,6 @@ Both files are included in this folder as examples.
 
 - **Always run dry-run first:** `python film_metadata_injector.py /path/to/folder`
 - **Backup is automatic:** EXIF metadata is saved as JSON before any changes
+- **Restore if needed:** `python film_metadata_injector.py /path/to/folder --restore`
 - **Parallel processing:** Use `--workers 4` for faster processing on SSDs
 - **Special characters:** The script handles brackets `[ ]`, Japanese characters, and spaces in paths

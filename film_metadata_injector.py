@@ -387,6 +387,45 @@ def ensure_backup(image_paths: List[Path], backup_dir: Path) -> None:
                 logger.warning(f"Failed to backup EXIF for '{img_path}': {exc}")
 
 
+def restore_from_backup(folder: Path) -> int:
+    """
+    Restore EXIF metadata from .film-metadata-injector-backup/ JSON files.
+    Returns number of images restored.
+    """
+    backup_dir = folder / BACKUP_DIR_NAME
+    if not backup_dir.exists():
+        logger.warning(f"No backup folder found in: {folder}")
+        return 0
+
+    backup_files = sorted(backup_dir.glob("*.exif-backup.json"))
+    if not backup_files:
+        logger.info(f"No backup files found in: {backup_dir}")
+        return 0
+
+    restored_count = 0
+    for backup_file in backup_files:
+        # Extract original filename from backup filename
+        # e.g., "photo_001.jpg.exif-backup.json" -> "photo_001.jpg"
+        img_name = backup_file.name.replace(".exif-backup.json", "")
+        img_path = folder / img_name
+
+        if not img_path.exists():
+            logger.warning(f"Original image not found for backup: {img_name}")
+            continue
+
+        try:
+            run_exiftool_with_args_file(
+                ["-j=" + str(backup_file), "-all:all", "-overwrite_original", str(img_path)],
+                timeout=60,
+            )
+            logger.info(f"Restored: {img_name}")
+            restored_count += 1
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.error(f"Failed to restore {img_name}: {exc}")
+
+    return restored_count
+
+
 def apply_exif_commands(image_path: Path, commands: List[Tuple[str, str, str, str]]) -> bool:
     """Apply ExifTool commands to an image. Returns True on success."""
     if not commands:
@@ -594,6 +633,11 @@ def parse_cli_args() -> argparse.Namespace:
              "Default: 1 (sequential). Use 4-8 for faster processing on SSDs.",
     )
     parser.add_argument(
+        "--restore",
+        action="store_true",
+        help="Restore EXIF from backups in .film-metadata-injector-backup/ folders",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -626,6 +670,25 @@ def main() -> None:
 
     # Check dependencies
     check_exiftool()
+
+    # Handle restore mode
+    if args.restore:
+        target_folders = [args.path]
+        if args.recursive:
+            target_folders = sorted([p for p in args.path.rglob("*") if p.is_dir()])
+            if args.path not in target_folders:
+                target_folders.insert(0, args.path)
+        
+        logger.info(f"Restore mode: scanning {len(target_folders)} folder(s)")
+        total_restored = 0
+        for folder in target_folders:
+            backup_dir = folder / BACKUP_DIR_NAME
+            if backup_dir.exists():
+                restored = restore_from_backup(folder)
+                total_restored += restored
+        
+        logger.info(f"Total images restored: {total_restored}")
+        return
 
     # Discover folders with metadata
     target_folders = discover_folders(args.path, args.recursive)

@@ -224,7 +224,17 @@ Before any write operation, the script automatically creates a hidden folder `.f
 
 ### Restore from backup
 
-If something goes wrong, restore the original EXIF with ExifTool:
+The script can restore EXIF metadata automatically:
+
+```bash
+# Restore a single folder
+python film_metadata_injector.py /path/to/folder --restore
+
+# Restore recursively
+python film_metadata_injector.py /path/to/folder --restore --recursive
+```
+
+Or manually with ExifTool:
 
 ```bash
 # Restore single image
