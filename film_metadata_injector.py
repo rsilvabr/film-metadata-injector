@@ -236,7 +236,16 @@ def get_exif_data(image_path: Path) -> Dict[str, str]:
         result = run_exiftool_with_args_file(["-j", "-a", str(image_path)], timeout=60)
         data = json.loads(result.stdout)
         if data and isinstance(data, list):
-            return {k: str(v) if v is not None else "" for k, v in data[0].items()}
+            exif = {}
+            for k, v in data[0].items():
+                if v is None:
+                    exif[k] = ""
+                elif k == "Keywords" and isinstance(v, list):
+                    # Bug C fix: Keep Keywords as comma-separated string for reliable checking
+                    exif[k] = ", ".join(str(item) for item in v)
+                else:
+                    exif[k] = str(v)
+            return exif
         return {}
     except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as exc:
         logger.warning(f"Could not read EXIF from '{image_path}': {exc}")
@@ -272,25 +281,25 @@ def build_exif_commands(
     make_will_change = bool(camera_make and str(camera_make) != old_make)
     model_will_change = bool(camera_model and str(camera_model) != old_model)
     
-    # --- scanner_info: capture ONLY when overwriting Make/Model ---
-    # On re-runs, extract "Scanner: X" from existing UserComment to preserve it
+    # --- scanner_info: ALWAYS extract from existing UserComment first ---
+    # This preserves scanner info even when refining camera_make/model in YAML
     scanner_info = ""
     current_uc = current_exif.get("UserComment", "")
     
-    if make_will_change or model_will_change:
-        # First run: capture the old Make/Model before they get overwritten
+    # Try to extract existing "Scanner: X" from UserComment (re-run safe)
+    if "Scanner:" in current_uc:
+        start = current_uc.find("Scanner: ") + len("Scanner: ")
+        end = current_uc.find(" |", start)
+        if end == -1:
+            scanner_info = current_uc[start:]
+        else:
+            scanner_info = current_uc[start:end]
+    
+    # Fallback: if no Scanner: in UserComment AND we're overwriting Make/Model,
+    # capture old Make/Model as scanner info (first run only)
+    if not scanner_info and (make_will_change or model_will_change):
         if old_make or old_model:
             scanner_info = f"{old_make} {old_model}".strip()
-    else:
-        # Re-run or no camera info in YAML: try to extract existing scanner info from UserComment
-        if "Scanner:" in current_uc:
-            # Extract text between "Scanner: " and next " |" or end of string
-            start = current_uc.find("Scanner: ") + len("Scanner: ")
-            end = current_uc.find(" |", start)
-            if end == -1:
-                scanner_info = current_uc[start:]
-            else:
-                scanner_info = current_uc[start:end]
     
     # --- camera_make -> EXIF:Make ---
     if camera_make and make_will_change:
@@ -461,7 +470,12 @@ def apply_exif_commands(image_path: Path, commands: List[Tuple[str, str, str, st
 
     args: List[str] = ["-q", "-overwrite_original"]
     for field, _, new_val, _ in commands:
-        args.append(f"{field}={new_val}")
+        # Bug A fix: ExifTool operators like += already include = in the field name
+        # Don't add another = or we get -Keywords+==value (keyword starts with =)
+        if field.endswith("+=") or field.endswith("-="):
+            args.append(f"{field}{new_val}")
+        else:
+            args.append(f"{field}={new_val}")
     args.append(str(image_path))
 
     try:

@@ -264,7 +264,65 @@ Type checkers couldn't infer that `error_exit()` never returns, causing false wa
 
 ---
 
+## Round 2 — Follow-up Review
+
+### Bug A: Keywords generated with literal `=` at start (`=Kodak Portra 400`)
+**Severity:** CRITICAL  
+**Location:** `build_exif_commands()` (line 391), `apply_exif_commands()` (line 464)
+
+**What it did:**
+The fix for Bug #3 introduced a worse bug. The tuple was `("-Keywords+=", ..., film_str, ...)`, and `apply_exif_commands()` formatted it as `f"{field}={new_val}"`, producing `-Keywords+==Kodak Portra 400` (double `=`).
+
+ExifTool interpreted this as a keyword literally starting with `=`: `=Kodak Portra 400`. Lightroom/Capture One would never filter by "Kodak" because the keyword began with `=`.
+
+**Impact:** All keywords were corrupted with a leading `=` character.
+
+**Fix:**
+- `apply_exif_commands()` now detects fields ending with `+=` or `-=` (ExifTool operators)
+- For these operators, appends `{field}{value}` (no extra `=`)
+- For normal fields, keeps `{field}={value}`
+
+---
+
+### Bug B: `scanner_info` still destroyed when refining camera_make/model
+**Severity:** HIGH  
+**Location:** `build_exif_commands()` (lines 280-293)
+
+**What it did:**
+The fix for Bug #2 only worked when Make/Model were identical between runs. But if you refined the YAML (e.g., "Olympus" → "Olympus Corporation"):
+
+1. **Run 1:** Make=NORITSU → `scanner_info = "NORITSU QSS"` ✓
+2. **Refine YAML:** camera_make="Olympus Corporation" (was "Olympus")
+3. **Run 2:** Make=Olympus (from Run 1), YAML=Olympus Corporation → `make_will_change=True` → `scanner_info = "Olympus QSS"` ❌
+
+The scanner info was replaced with the camera's own name because `old_make` was already the camera.
+
+**Fix:**
+- ALWAYS try to extract "Scanner: X" from existing UserComment first (re-run safe)
+- Only fall back to `old_make + old_model` if no "Scanner:" found in UserComment AND we're overwriting
+
+---
+
+### Bug C: False positives/negatives in Keywords duplicate check
+**Severity:** HIGH  
+**Location:** `get_exif_data()` (line 239), `build_exif_commands()` (line 389)
+
+**What it did:**
+When ExifTool returned multiple Keywords in JSON, it came as a list: `["Foo", "Bar"]`. `get_exif_data()` did `str(v)`, turning it into `"['Foo', 'Bar']"`.
+
+Two problems:
+1. **False negative:** If existing keyword was `"Tri-X"` and new is `"Tri-X 400"`, `"Tri-X 400" not in "['Tri-X']"` → adds duplicate
+2. **False positive:** If existing was `"Kodak Portra 400"` and new is `"Portra"`, `"Portra" in "['Kodak Portra 400']"` → skips legitimate new keyword
+
+**Fix:**
+- `get_exif_data()` now treats Keywords specially: if it's a list, joins with `", "` → `"Foo, Bar"`
+- The substring check `"Tri-X" in "Foo, Bar"` works correctly for exact matches
+
+---
+
 ## Summary
+
+### Round 1
 
 | Bug | Severity | Fixed |
 |-----|----------|-------|
@@ -272,8 +330,8 @@ Type checkers couldn't infer that `error_exit()` never returns, causing false wa
 | #2 | CRITICAL | scanner_info only captured on actual overwrite |
 | #3 | HIGH | Keywords use += for proper separation |
 | #4 | HIGH | scan_date takes priority over garbage move |
-| #5 | MEDIUM | scanner_info logic handles partial camera info |
-| #6 | MEDIUM | INI uses utf-8-sig for BOM support |
+| #5 | MEDIUM | scanner_info handles partial camera info |
+| #6 | MEDIUM | INI uses utf-8-sig for Windows Notepad BOM |
 | #7 | MEDIUM | suffix.lower() for cross-platform extensions |
 | #8 | LOW | Reuse EXIF read results |
 | #9 | LOW | Parallel analysis with ThreadPoolExecutor |
@@ -284,3 +342,11 @@ Type checkers couldn't infer that `error_exit()` never returns, causing false wa
 | #14 | LOW | Strip quotes from INI values |
 | #15 | LOW | error_exit returns NoReturn |
 | #16 | LOW | Remove dead recursive parameter |
+
+### Round 2
+
+| Bug | Severity | Fixed |
+|-----|----------|-------|
+| A | CRITICAL | Keywords operators (+=) no longer get double = |
+| B | HIGH | scanner_info always extracted from UserComment first |
+| C | HIGH | Keywords list properly serialized from ExifTool JSON |
