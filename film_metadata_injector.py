@@ -23,7 +23,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Tuple
 
 try:
     from rich.console import Console
@@ -59,11 +59,12 @@ else:
 # Constants
 # ---------------------------------------------------------------------------
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".tif", ".tiff"}
-METADATA_FILENAMES = ["film-metadata.yaml", "film-metadata.ini"]
+METADATA_FILENAMES = ["film-metadata.yaml", "film-metadata.yml", "film-metadata.ini"]
 BACKUP_DIR_NAME = ".film-metadata-injector-backup"
 DEFAULT_SCANNER_THRESHOLD = "2015-01-01"
 
-DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Accepts both YAML format (YYYY-MM-DD) and EXIF format (YYYY:MM:DD HH:MM:SS)
+DATE_PATTERN = re.compile(r"^\d{4}[-:]\d{2}[-:]\d{2}(?:\s+\d{2}:\d{2}:\d{2})?$")
 
 
 def to_exif_datetime(date_str: str) -> str:
@@ -87,12 +88,15 @@ def run_exiftool_with_args_file(args: List[str], timeout: int = 60) -> subproces
     with special characters (brackets, Japanese chars, etc.) in paths.
     Based on jxl-photo bug #5 fix.
     """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-        for arg in args:
-            f.write(arg + "\n")
-        arg_file = f.name
-    
+    arg_file = ""
     try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            for arg in args:
+                # Sanitize newlines to prevent breaking ExifTool arg-file parsing
+                safe_arg = str(arg).replace("\n", " ").replace("\r", " ")
+                f.write(safe_arg + "\n")
+            arg_file = f.name
+        
         result = subprocess.run(
             ["exiftool", "-@", arg_file],
             capture_output=True,
@@ -104,10 +108,11 @@ def run_exiftool_with_args_file(args: List[str], timeout: int = 60) -> subproces
         )
         return result
     finally:
-        os.unlink(arg_file)
+        if arg_file and os.path.exists(arg_file):
+            os.unlink(arg_file)
 
 
-def error_exit(message: str) -> None:
+def error_exit(message: str) -> NoReturn:
     """Log a fatal error and exit."""
     logger.error(message)
     sys.exit(1)
@@ -136,13 +141,18 @@ def check_exiftool() -> None:
 
 
 def parse_date(date_str: str) -> Optional[datetime.date]:
-    """Validate and convert a YYYY-MM-DD string."""
+    """Validate and convert a date string (YYYY-MM-DD or YYYY:MM:DD HH:MM:SS)."""
     if not date_str or not DATE_PATTERN.match(date_str):
         return None
     try:
+        # Try YAML format first (YYYY-MM-DD)
         return datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
-        return None
+        try:
+            # Try EXIF format (YYYY:MM:DD HH:MM:SS)
+            return datetime.datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S").date()
+        except ValueError:
+            return None
 
 
 def is_scanner_trash(date_str: str, threshold: datetime.date) -> bool:
@@ -180,7 +190,7 @@ def parse_ini(path: Path) -> Dict[str, str]:
     """
     data: Dict[str, str] = {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             for line_no, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line or line.startswith("#") or line.startswith(";"):
@@ -191,7 +201,12 @@ def parse_ini(path: Path) -> Dict[str, str]:
                     )
                     continue
                 key, value = line.split("=", 1)
-                data[key.strip()] = value.strip()
+                key = key.strip()
+                value = value.strip()
+                # Remove surrounding quotes if present (e.g., notes="value" -> value)
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                data[key] = value
         return data
     except OSError as exc:
         error_exit(f"I/O error reading '{path}': {exc}")
@@ -206,17 +221,12 @@ def find_metadata_file(folder: Path) -> Optional[Path]:
     return None
 
 
-def get_image_files(folder: Path, recursive: bool = False) -> List[Path]:
+def get_image_files(folder: Path) -> List[Path]:
     """List supported image files (JPEG/TIFF) in a folder."""
     files: set[Path] = set()
-    patterns = [f"*{ext}" for ext in SUPPORTED_EXTENSIONS]
-    patterns += [f"*{ext.upper()}" for ext in SUPPORTED_EXTENSIONS]
-    if recursive:
-        for pattern in patterns:
-            files.update(folder.rglob(pattern))
-    else:
-        for pattern in patterns:
-            files.update(folder.glob(pattern))
+    for f in folder.iterdir():
+        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS:
+            files.add(f)
     return sorted(files)
 
 
@@ -247,7 +257,7 @@ def build_exif_commands(
     
     Logic:
     - Make/Model: overwritten with camera info from YAML (searchable in Lightroom)
-    - Scanner info: preserved in UserComment
+    - Scanner info: preserved in UserComment (extracted from existing UserComment if re-run)
     - UserComment: comprehensive single string with Film, Scanner, Dev, Notes
     """
     commands: List[Tuple[str, str, str, str]] = []
@@ -255,25 +265,40 @@ def build_exif_commands(
     # Capture old Make/Model before we potentially overwrite them
     old_make = current_exif.get("Make", "")
     old_model = current_exif.get("Model", "")
+    
+    # Determine if we are ACTUALLY overwriting Make/Model this run
+    camera_make = metadata.get("camera_make")
+    camera_model = metadata.get("camera_model")
+    make_will_change = bool(camera_make and str(camera_make) != old_make)
+    model_will_change = bool(camera_model and str(camera_model) != old_model)
+    
+    # --- scanner_info: capture ONLY when overwriting Make/Model ---
+    # On re-runs, extract "Scanner: X" from existing UserComment to preserve it
     scanner_info = ""
+    current_uc = current_exif.get("UserComment", "")
+    
+    if make_will_change or model_will_change:
+        # First run: capture the old Make/Model before they get overwritten
+        if old_make or old_model:
+            scanner_info = f"{old_make} {old_model}".strip()
+    else:
+        # Re-run or no camera info in YAML: try to extract existing scanner info from UserComment
+        if "Scanner:" in current_uc:
+            # Extract text between "Scanner: " and next " |" or end of string
+            start = current_uc.find("Scanner: ") + len("Scanner: ")
+            end = current_uc.find(" |", start)
+            if end == -1:
+                scanner_info = current_uc[start:]
+            else:
+                scanner_info = current_uc[start:end]
     
     # --- camera_make -> EXIF:Make ---
-    camera_make = metadata.get("camera_make")
-    if camera_make:
-        if str(camera_make) != old_make:
-            commands.append(("-Make", old_make, str(camera_make), "camera_make"))
-        # If we're overwriting Make, capture scanner info for UserComment
-        if old_make or old_model:
-            scanner_info = f"{old_make} {old_model}".strip()
+    if camera_make and make_will_change:
+        commands.append(("-Make", old_make, str(camera_make), "camera_make"))
     
     # --- camera_model -> EXIF:Model ---
-    camera_model = metadata.get("camera_model")
-    if camera_model:
-        if str(camera_model) != old_model:
-            commands.append(("-Model", old_model, str(camera_model), "camera_model"))
-        # Update scanner_info with full Make Model
-        if old_make or old_model:
-            scanner_info = f"{old_make} {old_model}".strip()
+    if camera_model and model_will_change:
+        commands.append(("-Model", old_model, str(camera_model), "camera_model"))
 
     # --- iso -> EXIF:ISO ---
     iso = metadata.get("iso")
@@ -292,6 +317,8 @@ def build_exif_commands(
     # --- date -> EXIF:DateTimeOriginal (with scanner logic) ---
     date_raw = metadata.get("date")
     date_precision = metadata.get("date_precision", "")
+    has_scan_date = bool(metadata.get("scan_date"))
+    
     if date_raw and str(date_precision).lower() != "unknown":
         new_date = to_exif_datetime(str(date_raw))
         current_dto = current_exif.get("DateTimeOriginal", "")
@@ -302,17 +329,19 @@ def build_exif_commands(
                 ("-DateTimeOriginal", current_dto, new_date, "date (overwriting scanner garbage)")
             )
 
-            # Move old date to DateTimeDigitized, but only if empty or also garbage
-            current_dtd = current_exif.get("DateTimeDigitized", "")
-            if not current_dtd or is_scanner_trash(current_dtd, threshold):
-                if current_dto != current_dtd:
-                    commands.append(
-                        ("-DateTimeDigitized", current_dtd, current_dto, "scan_date (moved from old garbage)")
+            # Move old date to DateTimeDigitized ONLY if no scan_date in YAML
+            # If scan_date exists, it takes priority (Bug #4 fix)
+            if not has_scan_date:
+                current_dtd = current_exif.get("DateTimeDigitized", "")
+                if not current_dtd or is_scanner_trash(current_dtd, threshold):
+                    if current_dto != current_dtd:
+                        commands.append(
+                            ("-DateTimeDigitized", current_dtd, current_dto, "scan_date (moved from old garbage)")
+                        )
+                else:
+                    logger.info(
+                        f"Real DateTimeDigitized preserved ({current_dtd}); not overwriting."
                     )
-            else:
-                logger.info(
-                    f"Real DateTimeDigitized preserved ({current_dtd}); not overwriting."
-                )
         elif current_dto:
             # Scanner date looks real; keep it and warn
             logger.warning(
@@ -349,18 +378,17 @@ def build_exif_commands(
     
     if uc_parts:
         new_uc = " | ".join(uc_parts)
-        current_uc = current_exif.get("UserComment", "")
         # Only update if the new comprehensive string is different
         if new_uc != current_uc:
             commands.append(("-UserComment", current_uc, new_uc, "comprehensive metadata"))
 
-    # --- film -> IPTC:Keywords ---
+    # --- film -> IPTC:Keywords (Bug #3 fix: use += for proper keyword separation) ---
     if film:
         film_str = str(film)
         current_keywords = current_exif.get("Keywords", "")
         if film_str not in current_keywords:
-            new_keywords = f"{current_keywords}, {film_str}".strip(", ") if current_keywords else film_str
-            commands.append(("-Keywords", current_keywords, new_keywords, "film (Keywords)"))
+            # ExifTool: -Keywords+=value adds a keyword (does not create comma-separated string)
+            commands.append(("-Keywords+=", current_keywords, film_str, "film (Keywords)"))
 
     return commands
 
@@ -406,7 +434,7 @@ def restore_from_backup(folder: Path) -> int:
     for backup_file in backup_files:
         # Extract original filename from backup filename
         # e.g., "photo_001.jpg.exif-backup.json" -> "photo_001.jpg"
-        img_name = backup_file.name.replace(".exif-backup.json", "")
+        img_name = backup_file.name.removesuffix(".exif-backup.json")
         img_path = folder / img_name
 
         if not img_path.exists():
@@ -512,7 +540,7 @@ def process_folder(
     Process a single film-roll folder.
     Returns the number of images that were (or would be) modified.
     """
-    images = get_image_files(folder, recursive=False)
+    images = get_image_files(folder)
     if not images:
         logger.info(f"No images found in: {folder}")
         return 0
@@ -694,7 +722,7 @@ def main() -> None:
     target_folders = discover_folders(args.path, args.recursive)
     if not target_folders:
         logger.warning(
-            f"No '{METADATA_FILENAMES[0]}' or '{METADATA_FILENAMES[1]}' found."
+            f"No metadata file found (looked for: {', '.join(METADATA_FILENAMES)})."
         )
         sys.exit(0)
 
