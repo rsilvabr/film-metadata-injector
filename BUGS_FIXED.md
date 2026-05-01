@@ -349,15 +349,17 @@ Two problems:
 | #5 | MEDIUM | scanner_info handles partial camera info |
 | #6 | MEDIUM | INI uses utf-8-sig for Windows Notepad BOM |
 | #7 | MEDIUM | suffix.lower() for cross-platform extensions |
-| #8 | LOW | ⚠️ **NOT FIXED** — Documented but never implemented |
-| #9 | LOW | ⚠️ **NOT FIXED** — Documented but never implemented |
+| #8 | LOW | ✅ **FIXED in Round 3** — `cached_results` reuses EXIF reads |
+| #9 | LOW | ✅ **FIXED in Round 3** — `ThreadPoolExecutor` in analysis phase |
 | #10 | LOW | Added .yml to METADATA_FILENAMES |
 | #11 | LOW | Safe temp file cleanup |
 | #12 | LOW | Use removesuffix instead of replace |
 | #13 | LOW | Sanitize newlines in arg file |
 | #14 | LOW | Strip quotes from INI values |
 | #15 | LOW | error_exit returns NoReturn |
-| #16 | LOW | ⚠️ **NOT FIXED** — Documented but never implemented |
+| #16 | LOW | ✅ **FIXED in Round 3** — Removed dead `recursive` parameter |
+
+*Note: Bugs #8, #9, #16 were documented as fixed in Round 1 but were never actually implemented until Round 3 (commit 8571210). See Round 3 section for details.*
 
 ### Round 2
 
@@ -366,3 +368,25 @@ Two problems:
 | A | CRITICAL | Keywords operators (+=) no longer get double = |
 | B | HIGH | scanner_info always extracted from UserComment first |
 | C | HIGH | Keywords list properly serialized from ExifTool JSON |
+
+---
+
+### Round 3 — Actual Implementation (Commit 8571210)
+
+Bugs #8, #9, and #16 were previously documented as fixed in Round 1 but were never actually implemented in the code. They were properly fixed in this round, along with additional improvements identified during code review.
+
+| Bug | Severity | What was actually implemented |
+|-----|----------|-------------------------------|
+| #1 | CRITICAL | `apply_exif_commands` now runs inside `ThreadPoolExecutor` workers |
+| #2 | HIGH | `cached_results` dict stores commands from analysis; apply reuses cache without re-reading EXIF |
+| #3 | HIGH | Analysis phase now uses `ThreadPoolExecutor` (parallel like apply) |
+| #4 | HIGH | `DATE_PATTERN` accepts subseconds and timezone offsets; `parse_date` tries 4 formats; `is_scanner_trash` returns `False` for unparseable dates (conservative) |
+| #5 | MEDIUM | Removed dead `recursive` parameter from `process_folder()` |
+| #6 | MEDIUM | `current_keywords.split(", ")` with exact element comparison instead of substring check |
+| #7 | MEDIUM | `isinstance(v, list)` is now generic for all EXIF tags, not just Keywords |
+| #8 | LOW | `os.walk()` replaces `rglob("*")` for folder discovery |
+| #9 | LOW | Backup validation: re-creates if JSON is broken or too short |
+| #10 | LOW | `-q` only passed when NOT in verbose/debug mode |
+| #11 | LOW | Added warning log when `parse_date()` fails to parse a date |
+
+**Note on Bug #4:** The semantic change from "invalid date = garbage" to "invalid date = unknown" prevents accidental overwrites of real dates in non-standard formats. A warning is now logged when this happens, so users know the date was skipped intentionally.

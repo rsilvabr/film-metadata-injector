@@ -174,7 +174,11 @@ def is_scanner_trash(date_str: str, threshold: datetime.date) -> bool:
     """
     parsed = parse_date(date_str)
     if parsed is None:
-        return False  # Unparseable date = unknown, NOT garbage (conservative)
+        logger.warning(
+            f"Unparseable date '{date_str}', treating as unknown (not garbage). "
+            "If this is a scanner date that should be overwritten, check the format."
+        )
+        return False
     return parsed < threshold
 
 
