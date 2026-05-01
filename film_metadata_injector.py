@@ -73,9 +73,23 @@ DATE_PATTERN = re.compile(
 def to_exif_datetime(date_str: str) -> str:
     """
     Convert YYYY-MM-DD to EXIF datetime format YYYY:MM:DD 00:00:00.
+    Preserves time component if present in the input.
     ExifTool accepts many date formats, but DateTimeOriginal requires
     the standard EXIF format for reliable writing.
     """
+    # Already in EXIF format (YYYY:MM:DD or YYYY:MM:DD HH:MM:SS)
+    if re.match(r"^\d{4}:\d{2}:\d{2}( \d{2}:\d{2}:\d{2})?$", date_str):
+        if len(date_str) == 10:
+            return date_str + " 00:00:00"
+        return date_str
+    # YAML date only (YYYY-MM-DD) -> convert to EXIF
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+        return date_str.replace("-", ":") + " 00:00:00"
+    # YAML with time (YYYY-MM-DD HH:MM:SS) -> convert separators only
+    time_match = re.match(r"^(\d{4})-(\d{2})-(\d{2})( \d{2}:\d{2}:\d{2})$", date_str)
+    if time_match:
+        return date_str.replace("-", ":", 2)
+    # Fallback: try parse_date (will lose time, but at least won't crash)
     parsed = parse_date(date_str)
     if parsed is None:
         return date_str
@@ -153,10 +167,12 @@ def parse_date(date_str: str) -> Optional[datetime.date]:
         clean_str = clean_str[:-6]
     # Try formats from simplest to most specific
     formats = [
-        "%Y-%m-%d",          # YAML: 2023-05-15
-        "%Y:%m:%d",          # EXIF date only: 2023:05:15
-        "%Y:%m:%d %H:%M:%S", # EXIF with time: 2023:05:15 10:30:00
+        "%Y-%m-%d",              # YAML: 2023-05-15
+        "%Y:%m:%d",              # EXIF date only: 2023:05:15
+        "%Y:%m:%d %H:%M:%S",     # EXIF with time: 2023:05:15 10:30:00
         "%Y:%m:%d %H:%M:%S.%f",  # EXIF with subseconds: 2023:05:15 10:30:00.123
+        "%Y-%m-%d %H:%M:%S",     # YAML with time: 2023-05-15 10:30:00
+        "%Y-%m-%dT%H:%M:%S",     # ISO with T: 2023-05-15T10:30:00
     ]
     for fmt in formats:
         try:
@@ -182,22 +198,27 @@ def is_scanner_trash(date_str: str, threshold: datetime.date) -> bool:
     return parsed < threshold
 
 
+class MetadataParseError(Exception):
+    """Raised when a metadata file cannot be parsed."""
+    pass
+
+
 def parse_yaml(path: Path) -> Dict[str, Any]:
     """Read a YAML file and return a dictionary."""
     if not YAML_AVAILABLE:
-        error_exit("PyYAML is not installed. Install it with: pip install pyyaml")
+        raise MetadataParseError("PyYAML is not installed. Install it with: pip install pyyaml")
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         if data is None:
             return {}
         if not isinstance(data, dict):
-            error_exit(f"Invalid YAML file (not a dict): {path}")
+            raise MetadataParseError(f"Invalid YAML file (not a dict): {path}")
         return data
     except yaml.YAMLError as exc:
-        error_exit(f"Error reading YAML '{path}': {exc}")
+        raise MetadataParseError(f"Error reading YAML '{path}': {exc}")
     except OSError as exc:
-        error_exit(f"I/O error reading '{path}': {exc}")
+        raise MetadataParseError(f"I/O error reading '{path}': {exc}")
 
 
 def parse_ini(path: Path) -> Dict[str, str]:
@@ -225,7 +246,7 @@ def parse_ini(path: Path) -> Dict[str, str]:
                 data[key] = value
         return data
     except OSError as exc:
-        error_exit(f"I/O error reading '{path}': {exc}")
+        raise MetadataParseError(f"I/O error reading '{path}': {exc}")
 
 
 def find_metadata_file(folder: Path) -> Optional[Path]:
@@ -809,10 +830,14 @@ def main() -> None:
 
         logger.info(f"Processing: {folder} (metadata: {meta_file.name})")
 
-        if meta_file.suffix.lower() in (".yaml", ".yml"):
-            metadata = parse_yaml(meta_file)
-        else:
-            metadata = parse_ini(meta_file)
+        try:
+            if meta_file.suffix.lower() in (".yaml", ".yml"):
+                metadata = parse_yaml(meta_file)
+            else:
+                metadata = parse_ini(meta_file)
+        except MetadataParseError as exc:
+            logger.error(f"Skipping folder {folder}: {exc}")
+            continue
 
         # Basic date validation inside metadata
         for date_field in ("date", "scan_date"):
