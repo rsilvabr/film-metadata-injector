@@ -324,13 +324,9 @@ def build_exif_commands(
     current_uc = current_exif.get("UserComment", "")
     
     # Try to extract existing "Scanner: X" from UserComment (re-run safe)
-    if "Scanner:" in current_uc:
-        start = current_uc.find("Scanner: ") + len("Scanner: ")
-        end = current_uc.find(" |", start)
-        if end == -1:
-            scanner_info = current_uc[start:]
-        else:
-            scanner_info = current_uc[start:end]
+    scanner_match = re.search(r"Scanner:\s*([^|]+)", current_uc)
+    if scanner_match:
+        scanner_info = scanner_match.group(1).strip()
     
     # Fallback: if no Scanner: in UserComment AND we're overwriting Make/Model,
     # capture old Make/Model as scanner info (first run only)
@@ -407,6 +403,9 @@ def build_exif_commands(
             commands.append(("-DateTimeDigitized", current_dtd, scan_date_exif, "scan_date"))
 
     # --- Build comprehensive UserComment ---
+    # NOTE: UserComment is rebuilt from scratch on every run. If you remove a
+    # field (e.g., 'notes') from the YAML and re-run, it will be deleted from
+    # the EXIF. The YAML is the single source of truth for UserComment.
     film = metadata.get("film")
     dev = metadata.get("dev")
     notes = metadata.get("notes")
@@ -457,7 +456,7 @@ def _backup_single_image(img_path: Path, backup_dir: Path) -> Optional[Path]:
             pass  # Invalid or corrupt, will re-create
 
     try:
-        result = run_exiftool_with_args_file(["-j", "-a", str(img_path)], timeout=60)
+        result = run_exiftool_with_args_file(["-j", "-G", "-b", "-a", str(img_path)], timeout=60)
         with open(dest, "w", encoding="utf-8") as f:
             f.write(result.stdout)
         logger.debug(f"EXIF backup created: {dest}")
