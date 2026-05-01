@@ -423,13 +423,14 @@ def build_exif_commands(
 # ---------------------------------------------------------------------------
 # Backup and application
 # ---------------------------------------------------------------------------
-def ensure_backup(image_paths: List[Path], backup_dir: Path) -> None:
+def ensure_backup(image_paths: List[Path], backup_dir: Path) -> List[Path]:
     """
     Create an EXIF-only backup using ExifTool JSON format.
-    Much lighter than copying entire image files.
-    Restore with: exiftool -j=backup.json -all:all image.jpg
+    Returns list of images successfully backed up.
+    Abort applies if no backups can be created (prevents data loss).
     """
     backup_dir.mkdir(parents=True, exist_ok=True)
+    backed_up: List[Path] = []
     for img_path in image_paths:
         dest = backup_dir / f"{img_path.name}.exif-backup.json"
         needs_backup = True
@@ -439,6 +440,7 @@ def ensure_backup(image_paths: List[Path], backup_dir: Path) -> None:
                     content = f.read()
                 if content and len(content) > 10 and json.loads(content):
                     needs_backup = False
+                    backed_up.append(img_path)
             except (json.JSONDecodeError, OSError):
                 pass  # Invalid or corrupt backup, will re-create
 
@@ -448,8 +450,10 @@ def ensure_backup(image_paths: List[Path], backup_dir: Path) -> None:
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(result.stdout)
                 logger.debug(f"EXIF backup created: {dest}")
+                backed_up.append(img_path)
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-                logger.warning(f"Failed to backup EXIF for '{img_path}': {exc}")
+                logger.error(f"Failed to backup EXIF for '{img_path}': {exc}")
+    return backed_up
 
 
 def restore_from_backup(folder: Path) -> int:
@@ -606,18 +610,25 @@ def process_folder(
                 for img in images
             }
             for fut in as_completed(futures):
-                img_path, commands = fut.result()
+                try:
+                    img_path, commands = fut.result()
+                    if commands:
+                        cached_results[img_path] = commands
+                        for field, current, new_val, desc in commands:
+                            all_changes.append((img_path, field, current, new_val, desc))
+                except Exception as exc:
+                    img_path = futures[fut]
+                    logger.error(f"Failed to analyze {img_path}: {exc}")
+    else:
+        for img_path in images:
+            try:
+                _, commands = process_one_image(img_path, metadata, threshold)
                 if commands:
                     cached_results[img_path] = commands
                     for field, current, new_val, desc in commands:
                         all_changes.append((img_path, field, current, new_val, desc))
-    else:
-        for img_path in images:
-            _, commands = process_one_image(img_path, metadata, threshold)
-            if commands:
-                cached_results[img_path] = commands
-                for field, current, new_val, desc in commands:
-                    all_changes.append((img_path, field, current, new_val, desc))
+            except Exception as exc:
+                logger.error(f"Failed to analyze {img_path}: {exc}")
 
     if not all_changes:
         logger.info(f"No changes needed in: {folder}")
@@ -629,29 +640,41 @@ def process_folder(
         logger.info("Dry-run mode. Use --apply to execute changes.")
         return len(cached_results)
 
-    # Phase 2: Backup before applying
+    # Phase 2: Backup before applying (abort if none succeed)
     backup_dir = folder / BACKUP_DIR_NAME
-    ensure_backup(list(cached_results.keys()), backup_dir)
+    backed_up = ensure_backup(list(cached_results.keys()), backup_dir)
+    if not backed_up:
+        logger.error(f"No backups created for {folder}. Aborting to prevent data loss.")
+        return 0
+    # Only apply to images that were successfully backed up
+    images_to_apply = {img: cached_results[img] for img in backed_up if img in cached_results}
 
     # Phase 3: Apply changes (parallel if workers > 1)
     modified_count = 0
-    if workers > 1 and len(cached_results) > 1:
+    if workers > 1 and len(images_to_apply) > 1:
         logger.info(f"Applying with {workers} parallel workers...")
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {
                 ex.submit(apply_exif_commands, img_path, commands): img_path
-                for img_path, commands in cached_results.items()
+                for img_path, commands in images_to_apply.items()
             }
             for fut in as_completed(futures):
-                img_path = futures[fut]
-                if fut.result():
+                try:
+                    img_path = futures[fut]
+                    if fut.result():
+                        modified_count += 1
+                        logger.info(f"Applied: {img_path.name}")
+                except Exception as exc:
+                    img_path = futures[fut]
+                    logger.error(f"Failed to apply {img_path}: {exc}")
+    else:
+        for img_path, commands in images_to_apply.items():
+            try:
+                if apply_exif_commands(img_path, commands):
                     modified_count += 1
                     logger.info(f"Applied: {img_path.name}")
-    else:
-        for img_path, commands in cached_results.items():
-            if apply_exif_commands(img_path, commands):
-                modified_count += 1
-                logger.info(f"Applied: {img_path}")
+            except Exception as exc:
+                logger.error(f"Failed to apply {img_path}: {exc}")
 
     return modified_count
 
