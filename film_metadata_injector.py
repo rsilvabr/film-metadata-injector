@@ -142,6 +142,8 @@ def check_exiftool() -> None:
             ["exiftool", "-ver"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=True,
         )
@@ -345,9 +347,15 @@ def build_exif_commands(
     # --- iso -> EXIF:ISO ---
     iso = metadata.get("iso")
     if iso:
-        current_iso = current_exif.get("ISO", "")
-        if str(iso) != current_iso:
-            commands.append(("-ISO", current_iso, str(iso), "iso"))
+        try:
+            int(str(iso))
+        except ValueError:
+            logger.warning(f"Invalid ISO value '{iso}', must be numeric. Ignoring.")
+            iso = None
+        else:
+            current_iso = current_exif.get("ISO", "")
+            if str(iso) != current_iso:
+                commands.append(("-ISO", current_iso, str(iso), "iso"))
 
     # --- lens -> EXIF:LensModel ---
     lens = metadata.get("lens")
@@ -733,7 +741,9 @@ def discover_folders(root: Path, recursive: bool) -> List[Path]:
     """
     folders: List[Path] = []
     if recursive:
-        for dirpath, _, _ in os.walk(root):
+        for dirpath, dirnames, _ in os.walk(root):
+            # Skip hidden directories (e.g., .git, __pycache__, .film-metadata-injector-backup)
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             folder = Path(dirpath)
             if find_metadata_file(folder):
                 folders.append(folder)
@@ -819,7 +829,10 @@ def main() -> None:
     if args.restore:
         target_folders = [args.path]
         if args.recursive:
-            target_folders = sorted([p for p in args.path.rglob("*") if p.is_dir()])
+            target_folders = sorted([
+                p for p in args.path.rglob("*")
+                if p.is_dir() and not p.name.startswith(".")
+            ])
             if args.path not in target_folders:
                 target_folders.insert(0, args.path)
         
