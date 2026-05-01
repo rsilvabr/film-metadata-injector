@@ -63,8 +63,11 @@ METADATA_FILENAMES = ["film-metadata.yaml", "film-metadata.yml", "film-metadata.
 BACKUP_DIR_NAME = ".film-metadata-injector-backup"
 DEFAULT_SCANNER_THRESHOLD = "2015-01-01"
 
-# Accepts both YAML format (YYYY-MM-DD) and EXIF format (YYYY:MM:DD HH:MM:SS)
-DATE_PATTERN = re.compile(r"^\d{4}[-:]\d{2}[-:]\d{2}(?:\s+\d{2}:\d{2}:\d{2})?$")
+# Accepts YAML (YYYY-MM-DD) and EXIF formats with optional time/subsec/timezone
+DATE_PATTERN = re.compile(
+    r"^\d{4}[-:]\d{2}[-:]\d{2}"
+    r"(?:\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2})?)?$"
+)
 
 
 def to_exif_datetime(date_str: str) -> str:
@@ -141,28 +144,37 @@ def check_exiftool() -> None:
 
 
 def parse_date(date_str: str) -> Optional[datetime.date]:
-    """Validate and convert a date string (YYYY-MM-DD or YYYY:MM:DD HH:MM:SS)."""
+    """Validate and convert a date string (YYYY-MM-DD or EXIF variants)."""
     if not date_str or not DATE_PATTERN.match(date_str):
         return None
-    try:
-        # Try YAML format first (YYYY-MM-DD)
-        return datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-    except ValueError:
+    # Strip optional timezone offset for strptime (Python < 3.7 doesn't support %z with colons)
+    clean_str = date_str
+    if len(clean_str) > 19 and clean_str[-6] in "+-" and clean_str[-3] == ":":
+        clean_str = clean_str[:-6]
+    # Try formats from simplest to most specific
+    formats = [
+        "%Y-%m-%d",          # YAML: 2023-05-15
+        "%Y:%m:%d",          # EXIF date only: 2023:05:15
+        "%Y:%m:%d %H:%M:%S", # EXIF with time: 2023:05:15 10:30:00
+        "%Y:%m:%d %H:%M:%S.%f",  # EXIF with subseconds: 2023:05:15 10:30:00.123
+    ]
+    for fmt in formats:
         try:
-            # Try EXIF format (YYYY:MM:DD HH:MM:SS)
-            return datetime.datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S").date()
+            return datetime.datetime.strptime(clean_str, fmt).date()
         except ValueError:
-            return None
+            continue
+    return None
 
 
 def is_scanner_trash(date_str: str, threshold: datetime.date) -> bool:
     """
     Determine whether a scanner date is garbage (too old to be real).
     Returns True if the date is earlier than the threshold.
+    Returns False for unparseable dates (conservative: don't touch what we don't understand).
     """
     parsed = parse_date(date_str)
     if parsed is None:
-        return True  # Invalid date = garbage
+        return False  # Unparseable date = unknown, NOT garbage (conservative)
     return parsed < threshold
 
 
@@ -240,8 +252,8 @@ def get_exif_data(image_path: Path) -> Dict[str, str]:
             for k, v in data[0].items():
                 if v is None:
                     exif[k] = ""
-                elif k == "Keywords" and isinstance(v, list):
-                    # Bug C fix: Keep Keywords as comma-separated string for reliable checking
+                elif isinstance(v, list):
+                    # Generalized fix: convert any list to comma-separated string
                     exif[k] = ", ".join(str(item) for item in v)
                 else:
                     exif[k] = str(v)
@@ -395,7 +407,9 @@ def build_exif_commands(
     if film:
         film_str = str(film)
         current_keywords = current_exif.get("Keywords", "")
-        if film_str not in current_keywords:
+        # Split by ", " and compare exact elements to avoid substring false positives
+        existing_keywords = [kw.strip() for kw in current_keywords.split(", ") if kw.strip()]
+        if film_str not in existing_keywords:
             # ExifTool: -Keywords+=value adds a keyword (does not create comma-separated string)
             commands.append(("-Keywords+=", current_keywords, film_str, "film (Keywords)"))
 
@@ -414,7 +428,17 @@ def ensure_backup(image_paths: List[Path], backup_dir: Path) -> None:
     backup_dir.mkdir(parents=True, exist_ok=True)
     for img_path in image_paths:
         dest = backup_dir / f"{img_path.name}.exif-backup.json"
-        if not dest.exists():
+        needs_backup = True
+        if dest.exists():
+            try:
+                with open(dest, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if content and len(content) > 10 and json.loads(content):
+                    needs_backup = False
+            except (json.JSONDecodeError, OSError):
+                pass  # Invalid or corrupt backup, will re-create
+
+        if needs_backup:
             try:
                 result = run_exiftool_with_args_file(["-j", "-a", str(img_path)], timeout=60)
                 with open(dest, "w", encoding="utf-8") as f:
@@ -468,7 +492,10 @@ def apply_exif_commands(image_path: Path, commands: List[Tuple[str, str, str, st
     if not commands:
         return True
 
-    args: List[str] = ["-q", "-overwrite_original"]
+    args: List[str] = []
+    if not logger.isEnabledFor(logging.DEBUG):
+        args.append("-q")
+    args.append("-overwrite_original")
     for field, _, new_val, _ in commands:
         # Bug A fix: ExifTool operators like += already include = in the field name
         # Don't add another = or we get -Keywords+==value (keyword starts with =)
@@ -547,7 +574,6 @@ def process_folder(
     metadata: Dict[str, Any],
     threshold: datetime.date,
     apply: bool,
-    recursive: bool,
     workers: int = 1,
 ) -> int:
     """
@@ -565,16 +591,29 @@ def process_folder(
         logger.info(f"date_precision: {date_precision} (not written to EXIF)")
 
     all_changes: List[Tuple[Path, str, str, str, str]] = []
-    images_to_modify: List[Path] = []
+    cached_results: Dict[Path, List[Tuple[str, str, str, str]]] = {}
 
-    # Dry-run analysis: can be parallel too, but keep it simple
-    for img_path in images:
-        current_exif = get_exif_data(img_path)
-        commands = build_exif_commands(metadata, current_exif, threshold)
-        if commands:
-            images_to_modify.append(img_path)
-            for field, current, new_val, desc in commands:
-                all_changes.append((img_path, field, current, new_val, desc))
+    # Phase 1: Analysis (parallel if workers > 1)
+    if workers > 1 and len(images) > 1:
+        logger.info(f"Analyzing with {workers} parallel workers...")
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {
+                ex.submit(process_one_image, img, metadata, threshold): img
+                for img in images
+            }
+            for fut in as_completed(futures):
+                img_path, commands = fut.result()
+                if commands:
+                    cached_results[img_path] = commands
+                    for field, current, new_val, desc in commands:
+                        all_changes.append((img_path, field, current, new_val, desc))
+    else:
+        for img_path in images:
+            _, commands = process_one_image(img_path, metadata, threshold)
+            if commands:
+                cached_results[img_path] = commands
+                for field, current, new_val, desc in commands:
+                    all_changes.append((img_path, field, current, new_val, desc))
 
     if not all_changes:
         logger.info(f"No changes needed in: {folder}")
@@ -584,32 +623,28 @@ def process_folder(
 
     if not apply:
         logger.info("Dry-run mode. Use --apply to execute changes.")
-        return len(images_to_modify)
+        return len(cached_results)
 
-    # Backup before applying
+    # Phase 2: Backup before applying
     backup_dir = folder / BACKUP_DIR_NAME
-    ensure_backup(images_to_modify, backup_dir)
+    ensure_backup(list(cached_results.keys()), backup_dir)
 
-    # Apply changes in parallel
+    # Phase 3: Apply changes (parallel if workers > 1)
     modified_count = 0
-    if workers > 1 and len(images_to_modify) > 1:
+    if workers > 1 and len(cached_results) > 1:
         logger.info(f"Applying with {workers} parallel workers...")
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {
-                ex.submit(process_one_image, img, metadata, threshold): img
-                for img in images_to_modify
+                ex.submit(apply_exif_commands, img_path, commands): img_path
+                for img_path, commands in cached_results.items()
             }
             for fut in as_completed(futures):
-                img_path, commands = fut.result()
-                if commands:
-                    if apply_exif_commands(img_path, commands):
-                        modified_count += 1
-                        logger.info(f"Applied: {img_path.name}")
+                img_path = futures[fut]
+                if fut.result():
+                    modified_count += 1
+                    logger.info(f"Applied: {img_path.name}")
     else:
-        # Sequential mode (default or single image)
-        for img_path in images_to_modify:
-            current_exif = get_exif_data(img_path)
-            commands = build_exif_commands(metadata, current_exif, threshold)
+        for img_path, commands in cached_results.items():
             if apply_exif_commands(img_path, commands):
                 modified_count += 1
                 logger.info(f"Applied: {img_path}")
@@ -624,21 +659,18 @@ def discover_folders(root: Path, recursive: bool) -> List[Path]:
     """
     Discover folders that contain film-metadata.yaml or film-metadata.ini.
     When recursive=True, also scans subfolders.
+    Uses os.walk() for efficiency (avoids creating Path objects for every file).
     """
     folders: List[Path] = []
-    candidates = [root]
     if recursive:
-        candidates = sorted([p for p in root.rglob("*") if p.is_dir()])
-        if root not in candidates:
-            candidates.insert(0, root)
+        for dirpath, _, _ in os.walk(root):
+            folder = Path(dirpath)
+            if find_metadata_file(folder):
+                folders.append(folder)
     else:
-        candidates = [root]
-
-    for folder in candidates:
-        if find_metadata_file(folder):
-            folders.append(folder)
-
-    return folders
+        if find_metadata_file(root):
+            folders.append(root)
+    return sorted(folders)
 
 
 # ---------------------------------------------------------------------------
@@ -764,7 +796,7 @@ def main() -> None:
                 )
                 metadata.pop(date_field, None)
 
-        modified = process_folder(folder, metadata, threshold, args.apply, args.recursive, args.workers)
+        modified = process_folder(folder, metadata, threshold, args.apply, args.workers)
         total_modified += modified
 
     action = "applied" if args.apply else "detected (dry-run)"

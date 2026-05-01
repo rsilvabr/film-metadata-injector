@@ -2,6 +2,8 @@
 
 This document tracks all bugs found during code review and how they were fixed.
 
+> **⚠️ IMPORTANT NOTE:** Three bugs documented below as "Fixed" (#8, #9, #16) were **documented but never actually implemented in the code**. They remain active bugs in the current codebase and need to be addressed. See the updated entries below for details.
+
 ## Critical Bugs
 
 ### Bug #1: `parse_date` rejected EXIF format, breaking `--scanner-threshold`
@@ -145,31 +147,41 @@ The code searched for `*.jpg`, `*.JPG`, `*.tif`, `*.TIF` but missed variants lik
 
 ### Bug #8: EXIF read twice per image (performance)
 **Severity:** LOW  
-**Location:** `process_folder()` (lines 543-573)
+**Location:** `process_folder()` (lines 570-611)
 
 **What it did:**
 Each image's EXIF was read twice: once during dry-run analysis, and again during apply.
 
 **Impact:** Double the ExifTool calls. For 100 images, 200 calls instead of 100.
 
-**Fix:**
-- Stored results from first EXIF read and reused them during apply
-- Eliminated redundant ExifTool subprocess calls
+**Status: NOT FIXED IN CODE** ❌
+- The fix was documented here but never implemented in `film_metadata_injector.py`
+- `process_folder()` still calls `get_exif_data()` in both the analysis loop (line 572) and the apply phase (lines 540, 611)
+- The results from the first read are never stored or reused
+
+**Planned Fix:**
+- Store `current_exif` + `commands` in a dictionary during analysis
+- Reuse cached results during apply phase instead of reading EXIF again
 
 ---
 
 ### Bug #9: Initial analysis was always sequential, ignoring `--workers`
 **Severity:** LOW  
-**Location:** `process_folder()` (lines 543-573)
+**Location:** `process_folder()` (lines 570-577)
 
 **What it did:**
 Even with `--workers 8`, the dry-run analysis loop ran sequentially. Only the apply phase used parallel workers.
 
 **Impact:** Large rolls (100+ photos) were slow to analyze before applying.
 
-**Fix:**
-- Added `ThreadPoolExecutor` to the analysis phase as well
-- Both analysis and apply now respect `--workers`
+**Status: NOT FIXED IN CODE** ❌
+- The fix was documented here but never implemented in `film_metadata_injector.py`
+- The analysis loop (lines 570-577) still uses a plain `for` loop without any ThreadPoolExecutor
+- The comment even admits it: "Dry-run analysis: can be parallel too, but keep it simple"
+
+**Planned Fix:**
+- Add `ThreadPoolExecutor` to the analysis phase, matching the apply phase pattern
+- Cache EXIF results to avoid double-reading (see Bug #8)
 
 ---
 
@@ -253,14 +265,18 @@ Type checkers couldn't infer that `error_exit()` never returns, causing false wa
 
 ### Bug #16: Dead `recursive` parameter in `process_folder`
 **Severity:** LOW  
-**Location:** `process_folder()` signature and `get_image_files()` call
+**Location:** `process_folder()` signature (line 550) and `main()` call (line 767)
 
 **What it did:**
-`process_folder()` accepted a `recursive` parameter that was always passed as `False`. The actual recursion was handled by `discover_folders()` in `main()`.
+`process_folder()` accepted a `recursive` parameter that was never used inside the function. The actual recursion was handled by `discover_folders()` in `main()`.
 
-**Fix:**
-- Removed the unused `recursive` parameter from `process_folder()`
-- Removed the unused `recursive` parameter from `get_image_files()`
+**Status: NOT FIXED IN CODE** ❌
+- The fix was documented here but never implemented in `film_metadata_injector.py`
+- The `recursive` parameter still exists in the function signature and is still passed from `main()`
+
+**Planned Fix:**
+- Remove the unused `recursive` parameter from `process_folder()` signature
+- Remove `args.recursive` from the call in `main()`
 
 ---
 
@@ -333,15 +349,15 @@ Two problems:
 | #5 | MEDIUM | scanner_info handles partial camera info |
 | #6 | MEDIUM | INI uses utf-8-sig for Windows Notepad BOM |
 | #7 | MEDIUM | suffix.lower() for cross-platform extensions |
-| #8 | LOW | Reuse EXIF read results |
-| #9 | LOW | Parallel analysis with ThreadPoolExecutor |
+| #8 | LOW | ⚠️ **NOT FIXED** — Documented but never implemented |
+| #9 | LOW | ⚠️ **NOT FIXED** — Documented but never implemented |
 | #10 | LOW | Added .yml to METADATA_FILENAMES |
 | #11 | LOW | Safe temp file cleanup |
 | #12 | LOW | Use removesuffix instead of replace |
 | #13 | LOW | Sanitize newlines in arg file |
 | #14 | LOW | Strip quotes from INI values |
 | #15 | LOW | error_exit returns NoReturn |
-| #16 | LOW | Remove dead recursive parameter |
+| #16 | LOW | ⚠️ **NOT FIXED** — Documented but never implemented |
 
 ### Round 2
 
