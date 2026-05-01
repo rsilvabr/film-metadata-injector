@@ -444,36 +444,59 @@ def build_exif_commands(
 # ---------------------------------------------------------------------------
 # Backup and application
 # ---------------------------------------------------------------------------
-def ensure_backup(image_paths: List[Path], backup_dir: Path) -> List[Path]:
+def _backup_single_image(img_path: Path, backup_dir: Path) -> Optional[Path]:
+    """Backup a single image. Returns img_path on success, None on failure."""
+    dest = backup_dir / f"{img_path.name}.exif-backup.json"
+    if dest.exists():
+        try:
+            with open(dest, "r", encoding="utf-8") as f:
+                content = f.read()
+            if content and len(content) > 10 and json.loads(content):
+                return img_path  # Already backed up and valid
+        except (json.JSONDecodeError, OSError):
+            pass  # Invalid or corrupt, will re-create
+
+    try:
+        result = run_exiftool_with_args_file(["-j", "-a", str(img_path)], timeout=60)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(result.stdout)
+        logger.debug(f"EXIF backup created: {dest}")
+        return img_path
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.error(f"Failed to backup EXIF for '{img_path}': {exc}")
+        return None
+
+
+def ensure_backup(image_paths: List[Path], backup_dir: Path, workers: int = 1) -> List[Path]:
     """
     Create an EXIF-only backup using ExifTool JSON format.
     Returns list of images successfully backed up.
-    Abort applies if no backups can be created (prevents data loss).
+    Parallelizes backup creation when workers > 1.
     """
     backup_dir.mkdir(parents=True, exist_ok=True)
     backed_up: List[Path] = []
-    for img_path in image_paths:
-        dest = backup_dir / f"{img_path.name}.exif-backup.json"
-        needs_backup = True
-        if dest.exists():
-            try:
-                with open(dest, "r", encoding="utf-8") as f:
-                    content = f.read()
-                if content and len(content) > 10 and json.loads(content):
-                    needs_backup = False
-                    backed_up.append(img_path)
-            except (json.JSONDecodeError, OSError):
-                pass  # Invalid or corrupt backup, will re-create
 
-        if needs_backup:
-            try:
-                result = run_exiftool_with_args_file(["-j", "-a", str(img_path)], timeout=60)
-                with open(dest, "w", encoding="utf-8") as f:
-                    f.write(result.stdout)
-                logger.debug(f"EXIF backup created: {dest}")
-                backed_up.append(img_path)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-                logger.error(f"Failed to backup EXIF for '{img_path}': {exc}")
+    if workers > 1 and len(image_paths) > 1:
+        logger.info(f"Backing up with {workers} parallel workers...")
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {
+                ex.submit(_backup_single_image, img, backup_dir): img
+                for img in image_paths
+            }
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                    if result:
+                        backed_up.append(result)
+                except Exception as exc:
+                    img_path = futures[fut]
+                    logger.error(f"Backup failed for {img_path}: {exc}")
+    else:
+        for img_path in image_paths:
+            result = _backup_single_image(img_path, backup_dir)
+            if result:
+                backed_up.append(result)
+
     return backed_up
 
 
@@ -663,7 +686,7 @@ def process_folder(
 
     # Phase 2: Backup before applying (abort if none succeed)
     backup_dir = folder / BACKUP_DIR_NAME
-    backed_up = ensure_backup(list(cached_results.keys()), backup_dir)
+    backed_up = ensure_backup(list(cached_results.keys()), backup_dir, workers)
     if not backed_up:
         logger.error(f"No backups created for {folder}. Aborting to prevent data loss.")
         return 0
