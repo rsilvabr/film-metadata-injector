@@ -190,6 +190,10 @@ def is_scanner_trash(date_str: str, threshold: datetime.date) -> bool:
     Returns True if the date is earlier than the threshold.
     Returns False for unparseable dates (conservative: don't touch what we don't understand).
     """
+    # Explicitly treat all-zero dates (common scanner sentinel) as garbage
+    if re.match(r"^0000[-:]00[-:]00", date_str):
+        logger.debug(f"All-zero date '{date_str}' treated as scanner garbage.")
+        return True
     parsed = parse_date(date_str)
     if parsed is None:
         logger.warning(
@@ -697,6 +701,18 @@ def process_folder(
     if not backed_up:
         logger.error(f"No backups created for {folder}. Aborting to prevent data loss.")
         return 0
+
+    total_to_modify = len(cached_results)
+    backed_count = len(backed_up)
+    if backed_count < total_to_modify:
+        skipped = total_to_modify - backed_count
+        logger.warning(
+            f"Backup partial: {backed_count}/{total_to_modify} images backed up. "
+            f"{skipped} image(s) will be skipped. Check logs above for details."
+        )
+    else:
+        logger.info(f"All {backed_count} images backed up successfully.")
+
     # Only apply to images that were successfully backed up
     images_to_apply = {img: cached_results[img] for img in backed_up if img in cached_results}
 
