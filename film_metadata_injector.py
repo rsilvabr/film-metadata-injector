@@ -184,24 +184,39 @@ def parse_date(date_str: str) -> Optional[datetime.date]:
     return None
 
 
+# Module-level cache for is_scanner_trash results within a single run
+_scanner_trash_cache: Dict[Tuple[str, str], bool] = {}
+
+
 def is_scanner_trash(date_str: str, threshold: datetime.date) -> bool:
     """
     Determine whether a scanner date is garbage (too old to be real).
     Returns True if the date is earlier than the threshold.
     Returns False for unparseable dates (conservative: don't touch what we don't understand).
+    Results are cached per (date_str, threshold) to avoid duplicate logging.
     """
+    cache_key = (date_str, threshold.isoformat())
+    if cache_key in _scanner_trash_cache:
+        return _scanner_trash_cache[cache_key]
+
     # Explicitly treat all-zero dates (common scanner sentinel) as garbage
     if re.match(r"^0000[-:]00[-:]00", date_str):
         logger.debug(f"All-zero date '{date_str}' treated as scanner garbage.")
+        _scanner_trash_cache[cache_key] = True
         return True
+
     parsed = parse_date(date_str)
     if parsed is None:
         logger.warning(
             f"Unparseable date '{date_str}', treating as unknown (not garbage). "
             "If this is a scanner date that should be overwritten, check the format."
         )
+        _scanner_trash_cache[cache_key] = False
         return False
-    return parsed < threshold
+
+    result = parsed < threshold
+    _scanner_trash_cache[cache_key] = result
+    return result
 
 
 class MetadataParseError(Exception):
@@ -448,6 +463,8 @@ def build_exif_commands(
         if film_str not in existing_keywords:
             # ExifTool: -Keywords+=value adds a keyword (does not create comma-separated string)
             commands.append(("-Keywords+=", current_keywords, film_str, "film (Keywords)"))
+            # Also write to XMP for maximum Lightroom/Capture One compatibility
+            commands.append(("-XMP-dc:Subject+=", current_keywords, film_str, "film (XMP Subject)"))
 
     return commands
 

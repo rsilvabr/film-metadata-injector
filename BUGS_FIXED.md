@@ -377,16 +377,16 @@ Bugs #8, #9, and #16 were previously documented as fixed in Round 1 but were nev
 
 | Bug | Severity | What was actually implemented |
 |-----|----------|-------------------------------|
-| #1 | CRITICAL | `apply_exif_commands` now runs inside `ThreadPoolExecutor` workers |
-| #2 | HIGH | `cached_results` dict stores commands from analysis; apply reuses cache without re-reading EXIF |
-| #3 | HIGH | Analysis phase now uses `ThreadPoolExecutor` (parallel like apply) |
-| #4 | HIGH | `DATE_PATTERN` accepts subseconds and timezone offsets; `parse_date` tries 4 formats; `is_scanner_trash` returns `False` for unparseable dates (conservative) |
-| #5 | MEDIUM | Removed dead `recursive` parameter from `process_folder()` |
-| #6 | MEDIUM | `current_keywords.split(", ")` with exact element comparison instead of substring check |
-| #7 | MEDIUM | `isinstance(v, list)` is now generic for all EXIF tags, not just Keywords |
-| #8 | LOW | `os.walk()` replaces `rglob("*")` for folder discovery |
-| #9 | LOW | Backup validation: re-creates if JSON is broken or too short |
-| #10 | LOW | `-q` only passed when NOT in verbose/debug mode |
-| #11 | LOW | Added warning log when `parse_date()` fails to parse a date |
+| #17 | CRITICAL | `apply_exif_commands` now runs inside `ThreadPoolExecutor` workers |
+| #18 | HIGH | `cached_results` dict stores commands from analysis; apply reuses cache without re-reading EXIF |
+| #19 | HIGH | Analysis phase now uses `ThreadPoolExecutor` (parallel like apply) |
+| #20 | HIGH | `DATE_PATTERN` accepts subseconds and timezone offsets; `parse_date` tries 4 formats; `is_scanner_trash` returns `False` for unparseable dates (conservative) |
+| #21 | MEDIUM | Removed dead `recursive` parameter from `process_folder()` |
+| #22 | MEDIUM | `current_keywords.split(", ")` with exact element comparison instead of substring check |
+| #23 | MEDIUM | `isinstance(v, list)` is now generic for all EXIF tags, not just Keywords |
+| #24 | LOW | `os.walk()` replaces `rglob("*")` for folder discovery |
+| #25 | LOW | Backup validation: re-creates if JSON is broken or too short |
+| #26 | LOW | `-q` only passed when NOT in verbose/debug mode |
+| #27 | LOW | Added warning log when `parse_date()` fails to parse a date |
 
 **Note on Bug #4:** The semantic change from "invalid date = garbage" to "invalid date = unknown" prevents accidental overwrites of real dates in non-standard formats. A warning is now logged when this happens, so users know the date was skipped intentionally.

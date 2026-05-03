@@ -109,6 +109,8 @@ Film: Kodak Gold 200 | Scanner: NORITSU KOKI QSS-32_33 | Dev: C-41 | Notes: Cycl
 
 This makes it easy to read all metadata at a glance while keeping Make/Model clean for software filters.
 
+> **Warning:** `UserComment` is rebuilt from scratch on every run. If you remove a field (e.g., `notes`) from the YAML and re-run, it will be deleted from the EXIF. The YAML is the single source of truth for UserComment. Any existing UserComment content not related to Film/Scanner/Dev/Notes will be lost.
+
 ### Special Characters in Paths
 
 The script handles paths with brackets `[ ]`, Japanese characters, spaces, and other special characters correctly by passing all arguments to ExifTool via a temporary argument file (`-@` flag). This prevents ExifTool from interpreting brackets as wildcards and ensures Unicode paths work on Windows.
@@ -222,6 +224,17 @@ The script uses Python's `ThreadPoolExecutor` (same approach as `jxl-photo`), sp
 
 Before any write operation, the script automatically creates a hidden folder `.film-metadata-injector-backup/` inside the photo folder and saves **only the EXIF metadata** as JSON files (not the entire image). This keeps backups tiny (a few KB per photo instead of multi-MB copies).
 
+### Backup Limitations
+
+The EXIF-only backup captures most metadata tags but **does not** preserve:
+
+- Embedded ICC color profiles
+- MakerNotes with proprietary binary offsets
+- Thumbnails and preview images
+- Non-standard tags that ExifTool doesn't export to JSON
+
+For critical archival work, consider keeping a separate full-file backup (e.g., RAID, cloud sync, or `rsync`). The JSON backup is designed for quick metadata recovery, not as a complete image archive.
+
 ### Restore from backup
 
 The script can restore EXIF metadata automatically:
@@ -233,6 +246,8 @@ python film_metadata_injector.py /path/to/folder --restore
 # Restore recursively
 python film_metadata_injector.py /path/to/folder --restore --recursive
 ```
+
+**Note:** Restore uses `-all:all` which attempts to write all tags. Read-only tags (FileSize, ImageWidth, etc.) are ignored by ExifTool but may generate warnings.
 
 Or manually with ExifTool:
 
