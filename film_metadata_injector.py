@@ -272,11 +272,20 @@ def parse_ini(path: Path) -> Dict[str, str]:
 
 def find_metadata_file(folder: Path) -> Optional[Path]:
     """Look for film-metadata.yaml or film-metadata.ini in a folder."""
+    found = []
     for filename in METADATA_FILENAMES:
         candidate = folder / filename
         if candidate.exists():
-            return candidate
-    return None
+            found.append(candidate)
+    
+    if len(found) > 1:
+        logger.warning(
+            f"Multiple metadata files found in {folder}: "
+            f"{', '.join(f.name for f in found)}. "
+            f"Using {found[0].name}."
+        )
+    
+    return found[0] if found else None
 
 
 def get_image_files(folder: Path) -> List[Path]:
@@ -305,7 +314,7 @@ def get_exif_data(image_path: Path) -> Dict[str, str]:
                     exif[k] = str(v)
             return exif
         return {}
-    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as exc:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
         logger.warning(f"Could not read EXIF from '{image_path}': {exc}")
         return {}
 
@@ -365,16 +374,18 @@ def build_exif_commands(
 
     # --- iso -> EXIF:ISO ---
     iso = metadata.get("iso")
-    if iso:
+    if iso is not None:
         try:
-            int(str(iso))
+            iso_val = float(str(iso))
+            if iso_val <= 0:
+                logger.warning(f"ISO must be positive, got '{iso}'. Ignoring.")
+            else:
+                iso_int = int(iso_val)
+                current_iso = current_exif.get("ISO", "")
+                if str(iso_int) != current_iso:
+                    commands.append(("-ISO", current_iso, str(iso_int), "iso"))
         except ValueError:
             logger.warning(f"Invalid ISO value '{iso}', must be numeric. Ignoring.")
-            iso = None
-        else:
-            current_iso = current_exif.get("ISO", "")
-            if str(iso) != current_iso:
-                commands.append(("-ISO", current_iso, str(iso), "iso"))
 
     # --- lens -> EXIF:LensModel ---
     lens = metadata.get("lens")
@@ -413,10 +424,13 @@ def build_exif_commands(
                     )
         elif current_dto:
             # Scanner date looks real; keep it and warn
-            logger.warning(
-                f"Scanner DateTimeOriginal ({current_dto}) >= threshold; keeping original. "
-                f"YAML date ({new_date}) not applied."
-            )
+            if current_dto == new_date:
+                logger.debug("DateTimeOriginal already matches YAML value.")
+            else:
+                logger.warning(
+                    f"Scanner DateTimeOriginal ({current_dto}) >= threshold; keeping original. "
+                    f"YAML date ({new_date}) not applied."
+                )
         else:
             # No existing DateTimeOriginal; write directly
             commands.append(("-DateTimeOriginal", "", new_date, "date"))
@@ -837,7 +851,10 @@ def parse_cli_args() -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
+    return args
 
 
 # ---------------------------------------------------------------------------
