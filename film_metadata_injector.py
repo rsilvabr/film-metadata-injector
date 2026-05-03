@@ -77,16 +77,16 @@ def to_exif_datetime(date_str: str) -> str:
     ExifTool accepts many date formats, but DateTimeOriginal requires
     the standard EXIF format for reliable writing.
     """
-    # Already in EXIF format (YYYY:MM:DD or YYYY:MM:DD HH:MM:SS)
-    if re.match(r"^\d{4}:\d{2}:\d{2}( \d{2}:\d{2}:\d{2})?$", date_str):
+    # Already in EXIF format (YYYY:MM:DD or YYYY:MM:DD HH:MM:SS or with subseconds)
+    if re.match(r"^\d{4}:\d{2}:\d{2}( \d{2}:\d{2}:\d{2}(\.\d+)?)?$", date_str):
         if len(date_str) == 10:
             return date_str + " 00:00:00"
         return date_str
     # YAML date only (YYYY-MM-DD) -> convert to EXIF
     if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
         return date_str.replace("-", ":") + " 00:00:00"
-    # YAML with time (YYYY-MM-DD HH:MM:SS) -> convert separators only
-    time_match = re.match(r"^(\d{4})-(\d{2})-(\d{2})( \d{2}:\d{2}:\d{2})$", date_str)
+    # YAML with time (YYYY-MM-DD HH:MM:SS or with subseconds) -> convert separators only
+    time_match = re.match(r"^(\d{4})-(\d{2})-(\d{2})( \d{2}:\d{2}:\d{2}(\.\d+)?)$", date_str)
     if time_match:
         return date_str.replace("-", ":", 2)
     # Fallback: try parse_date (will lose time, but at least won't crash)
@@ -462,8 +462,16 @@ def _backup_single_image(img_path: Path, backup_dir: Path) -> Optional[Path]:
         try:
             with open(dest, "r", encoding="utf-8") as f:
                 content = f.read()
-            if content and len(content) > 10 and json.loads(content):
-                return img_path  # Already backed up and valid
+            if content:
+                data = json.loads(content)
+                # Validate structure: must be a list with a dict containing key tags
+                if (
+                    isinstance(data, list)
+                    and len(data) > 0
+                    and isinstance(data[0], dict)
+                    and len(data[0]) >= 3
+                ):
+                    return img_path  # Already backed up and valid
         except (json.JSONDecodeError, OSError):
             pass  # Invalid or corrupt, will re-create
 
@@ -845,13 +853,16 @@ def main() -> None:
     if args.restore:
         target_folders = [args.path]
         if args.recursive:
-            target_folders = sorted([
-                p for p in args.path.rglob("*")
-                if p.is_dir() and not p.name.startswith(".")
-            ])
+            # Use os.walk for efficiency and skip hidden directories
+            _folders = []
+            for dirpath, dirnames, _ in os.walk(args.path):
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                folder = Path(dirpath)
+                _folders.append(folder)
+            target_folders = sorted(_folders)
             if args.path not in target_folders:
                 target_folders.insert(0, args.path)
-        
+
         logger.info(f"Restore mode: scanning {len(target_folders)} folder(s)")
         total_restored = 0
         for folder in target_folders:
