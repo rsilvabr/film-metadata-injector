@@ -26,6 +26,8 @@ Place a `film-metadata.yaml` (or `film-metadata.ini`) file inside each folder co
 **Where it goes:** 
 - EXIF:UserComment (prefixed with "Film: ")
 - IPTC:Keywords (flat, searchable in Lightroom)
+- XMP-dc:Subject (Lightroom/Capture One compatibility)
+**Deduplication:** Use `--dedup-mode preserve` to only append if absent, or `--dedup-mode normalize` (default) to rewrite both IPTC and XMP keyword lists, removing duplicates and keeping them in sync.  
 **Example:** `Kodak Gold 200`
 
 ### iso
@@ -36,7 +38,7 @@ Place a `film-metadata.yaml` (or `film-metadata.ini`) file inside each folder co
 ### date
 **What it is:** Date the roll was shot (YYYY-MM-DD)  
 **Where it goes:** EXIF:DateTimeOriginal  
-**Special behavior:** If the photo already has a DateTimeOriginal that looks like scanner garbage (before 2015), it gets overwritten. The old date moves to DateTimeDigitized.  
+**Special behavior:** If the photo already has a DateTimeOriginal that looks like scanner garbage (before 2015), it gets overwritten. The old date moves to `EXIF:CreateDate` and `XMP-exif:DateTimeDigitized` only if those fields are empty or also garbage, and it is not all zeros.  
 **Example:** `2023-03-01`
 
 ### date_precision
@@ -49,7 +51,7 @@ Place a `film-metadata.yaml` (or `film-metadata.ini`) file inside each folder co
 
 ### scan_date
 **What it is:** When the film was scanned (optional)  
-**Where it goes:** EXIF:DateTimeDigitized  
+**Where it goes:** `EXIF:CreateDate` (ExifTool's name for `DateTimeDigitized`) and `XMP-exif:DateTimeDigitized`, kept in sync  
 **Example:** `2024-03-10`
 
 ### lens

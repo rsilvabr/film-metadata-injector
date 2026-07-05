@@ -66,8 +66,35 @@ DEFAULT_SCANNER_THRESHOLD = "2015-01-01"
 # Accepts YAML (YYYY-MM-DD) and EXIF formats with optional time/subsec/timezone
 DATE_PATTERN = re.compile(
     r"^\d{4}[-:]\d{2}[-:]\d{2}"
-    r"(?:\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2})?)?$"
+    r"(?:[T\s]+\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2})?)?$"
 )
+
+
+def parse_date(date_str: str) -> Optional[datetime.date]:
+    """Validate and convert a date string (YYYY-MM-DD or EXIF variants)."""
+    if not date_str or not DATE_PATTERN.match(date_str):
+        return None
+    # Strip optional timezone offset for strptime (Python < 3.7 doesn't support %z with colons)
+    clean_str = date_str
+    tz_match = re.search(r"([+-]\d{2}):?(\d{2})$", date_str)
+    if tz_match:
+        clean_str = date_str[:tz_match.start()]
+    # Try formats from simplest to most specific
+    formats = [
+        "%Y-%m-%d",              # YAML: 2023-05-15
+        "%Y:%m:%d",              # EXIF date only: 2023:05:15
+        "%Y:%m:%d %H:%M:%S",     # EXIF with time: 2023:05:15 10:30:00
+        "%Y:%m:%d %H:%M:%S.%f",  # EXIF with subseconds: 2023:05:15 10:30:00.123
+        "%Y-%m-%d %H:%M:%S",     # YAML with time: 2023-05-15 10:30:00
+        "%Y-%m-%dT%H:%M:%S",     # ISO with T: 2023-05-15T10:30:00
+        "%Y-%m-%dT%H:%M:%S.%f",  # ISO with T and subseconds
+    ]
+    for fmt in formats:
+        try:
+            return datetime.datetime.strptime(clean_str, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 def to_exif_datetime(date_str: str) -> str:
@@ -159,31 +186,6 @@ def check_exiftool() -> None:
         error_exit("ExifTool did not respond in time.")
 
 
-def parse_date(date_str: str) -> Optional[datetime.date]:
-    """Validate and convert a date string (YYYY-MM-DD or EXIF variants)."""
-    if not date_str or not DATE_PATTERN.match(date_str):
-        return None
-    # Strip optional timezone offset for strptime (Python < 3.7 doesn't support %z with colons)
-    clean_str = date_str
-    if len(clean_str) > 19 and clean_str[-6] in "+-" and clean_str[-3] == ":":
-        clean_str = clean_str[:-6]
-    # Try formats from simplest to most specific
-    formats = [
-        "%Y-%m-%d",              # YAML: 2023-05-15
-        "%Y:%m:%d",              # EXIF date only: 2023:05:15
-        "%Y:%m:%d %H:%M:%S",     # EXIF with time: 2023:05:15 10:30:00
-        "%Y:%m:%d %H:%M:%S.%f",  # EXIF with subseconds: 2023:05:15 10:30:00.123
-        "%Y-%m-%d %H:%M:%S",     # YAML with time: 2023-05-15 10:30:00
-        "%Y-%m-%dT%H:%M:%S",     # ISO with T: 2023-05-15T10:30:00
-    ]
-    for fmt in formats:
-        try:
-            return datetime.datetime.strptime(clean_str, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-
 # Module-level cache for is_scanner_trash results within a single run
 _scanner_trash_cache: Dict[Tuple[str, str], bool] = {}
 
@@ -229,8 +231,19 @@ def parse_yaml(path: Path) -> Dict[str, Any]:
     if not YAML_AVAILABLE:
         raise MetadataParseError("PyYAML is not installed. Install it with: pip install pyyaml")
     try:
+        # Keep scalar booleans (YES/NO/ON/OFF/TRUE/FALSE) as strings.
+        class _StringBoolSafeLoader(yaml.SafeLoader):
+            pass
+
+        def _bool_as_string(loader, node):
+            return node.value
+
+        _StringBoolSafeLoader.add_constructor(
+            "tag:yaml.org,2002:bool", _bool_as_string
+        )
+
         with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+            data = yaml.load(f, Loader=_StringBoolSafeLoader)
         if data is None:
             return {}
         if not isinstance(data, dict):
@@ -250,15 +263,22 @@ def parse_ini(path: Path) -> Dict[str, str]:
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
             for line_no, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line or line.startswith("#") or line.startswith(";"):
+                # Strip inline comments only after a value has started.
+                # Semicolon/colon at the very beginning is still a comment.
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or stripped.startswith(";"):
                     continue
-                if "=" not in line:
+                # Remove inline comment starting with " ;" or " #" to avoid
+                # accidentally splitting values that contain those characters.
+                for marker in (" ;", " #"):
+                    if marker in stripped:
+                        stripped = stripped.split(marker, 1)[0].rstrip()
+                if "=" not in stripped:
                     logger.warning(
-                        f"Line {line_no} skipped in '{path}' (no '='): {line}"
+                        f"Line {line_no} skipped in '{path}' (no '='): {line.strip()}"
                     )
                     continue
-                key, value = line.split("=", 1)
+                key, value = stripped.split("=", 1)
                 key = key.strip()
                 value = value.strip()
                 # Remove surrounding quotes if present (e.g., notes="value" -> value)
@@ -297,10 +317,31 @@ def get_image_files(folder: Path) -> List[Path]:
     return sorted(files)
 
 
-def get_exif_data(image_path: Path) -> Dict[str, str]:
-    """Read EXIF metadata from an image using ExifTool (JSON output)."""
+def get_exif_data(image_path: Path, timeout: int = 60) -> Optional[Dict[str, str]]:
+    """
+    Read EXIF metadata from an image using ExifTool (JSON output).
+    Returns None if reading failed (distinguishes from empty EXIF).
+    Tags that can exist in both EXIF and XMP are read from EXIF explicitly
+    so the decision logic is deterministic.
+    """
+    # Read EXIF-specific tags explicitly to avoid ambiguity between EXIF/XMP.
+    # Note: ExifTool uses "CreateDate" for the EXIF DateTimeDigitized tag.
+    explicit_tags = [
+        "-EXIF:Make",
+        "-EXIF:Model",
+        "-EXIF:ISO",
+        "-EXIF:LensModel",
+        "-EXIF:DateTimeOriginal",
+        "-EXIF:CreateDate",
+        "-EXIF:UserComment",
+        "-IPTC:Keywords",
+        "-XMP-dc:Subject",
+    ]
     try:
-        result = run_exiftool_with_args_file(["-j", "-a", str(image_path)], timeout=60)
+        result = run_exiftool_with_args_file(
+            ["-j", "-a", "-G"] + explicit_tags + [str(image_path)],
+            timeout=timeout,
+        )
         data = json.loads(result.stdout)
         if data and isinstance(data, list):
             exif = {}
@@ -308,15 +349,16 @@ def get_exif_data(image_path: Path) -> Dict[str, str]:
                 if v is None:
                     exif[k] = ""
                 elif isinstance(v, list):
-                    # Generalized fix: convert any list to comma-separated string
-                    exif[k] = ", ".join(str(item) for item in v)
+                    # Preserve list semantics for keywords by joining only
+                    # non-empty items with a separator that is unlikely in values.
+                    exif[k] = "\x00".join(str(item) for item in v if str(item))
                 else:
                     exif[k] = str(v)
             return exif
         return {}
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
         logger.warning(f"Could not read EXIF from '{image_path}': {exc}")
-        return {}
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -324,8 +366,9 @@ def get_exif_data(image_path: Path) -> Dict[str, str]:
 # ---------------------------------------------------------------------------
 def build_exif_commands(
     metadata: Dict[str, Any],
-    current_exif: Dict[str, str],
+    current_exif: Optional[Dict[str, str]],
     threshold: datetime.date,
+    dedup_mode: str = "normalize",
 ) -> List[Tuple[str, str, str, str]]:
     """
     Build a list of ExifTool commands from the metadata file.
@@ -337,10 +380,14 @@ def build_exif_commands(
     - UserComment: comprehensive single string with Film, Scanner, Dev, Notes
     """
     commands: List[Tuple[str, str, str, str]] = []
+
+    # If EXIF read failed, skip all logic that depends on it.
+    if current_exif is None:
+        return commands
     
     # Capture old Make/Model before we potentially overwrite them
-    old_make = current_exif.get("Make", "")
-    old_model = current_exif.get("Model", "")
+    old_make = current_exif.get("EXIF:Make", "")
+    old_model = current_exif.get("EXIF:Model", "")
     
     # Determine if we are ACTUALLY overwriting Make/Model this run
     camera_make = metadata.get("camera_make")
@@ -351,7 +398,7 @@ def build_exif_commands(
     # --- scanner_info: ALWAYS extract from existing UserComment first ---
     # This preserves scanner info even when refining camera_make/model in YAML
     scanner_info = ""
-    current_uc = current_exif.get("UserComment", "")
+    current_uc = current_exif.get("EXIF:UserComment", "")
     
     # Try to extract existing "Scanner: X" from UserComment (re-run safe)
     scanner_match = re.search(r"Scanner:\s*([^|]+)", current_uc)
@@ -366,11 +413,11 @@ def build_exif_commands(
     
     # --- camera_make -> EXIF:Make ---
     if camera_make and make_will_change:
-        commands.append(("-Make", old_make, str(camera_make), "camera_make"))
+        commands.append(("-EXIF:Make", old_make, str(camera_make), "camera_make"))
     
     # --- camera_model -> EXIF:Model ---
     if camera_model and model_will_change:
-        commands.append(("-Model", old_model, str(camera_model), "camera_model"))
+        commands.append(("-EXIF:Model", old_model, str(camera_model), "camera_model"))
 
     # --- iso -> EXIF:ISO ---
     iso = metadata.get("iso")
@@ -381,18 +428,18 @@ def build_exif_commands(
                 logger.warning(f"ISO must be positive, got '{iso}'. Ignoring.")
             else:
                 iso_int = int(iso_val)
-                current_iso = current_exif.get("ISO", "")
+                current_iso = current_exif.get("EXIF:ISO", "")
                 if str(iso_int) != current_iso:
-                    commands.append(("-ISO", current_iso, str(iso_int), "iso"))
+                    commands.append(("-EXIF:ISO", current_iso, str(iso_int), "iso"))
         except ValueError:
             logger.warning(f"Invalid ISO value '{iso}', must be numeric. Ignoring.")
 
     # --- lens -> EXIF:LensModel ---
     lens = metadata.get("lens")
     if lens:
-        current_lens = current_exif.get("LensModel", "")
+        current_lens = current_exif.get("EXIF:LensModel", "")
         if not current_lens or str(lens) != current_lens:
-            commands.append(("-LensModel", current_lens, str(lens), "lens"))
+            commands.append(("-EXIF:LensModel", current_lens, str(lens), "lens"))
 
     # --- date -> EXIF:DateTimeOriginal (with scanner logic) ---
     date_raw = metadata.get("date")
@@ -401,22 +448,25 @@ def build_exif_commands(
     
     if date_raw and str(date_precision).lower() != "unknown":
         new_date = to_exif_datetime(str(date_raw))
-        current_dto = current_exif.get("DateTimeOriginal", "")
+        current_dto = current_exif.get("EXIF:DateTimeOriginal", "")
 
         if current_dto and is_scanner_trash(current_dto, threshold):
             # Overwrite DateTimeOriginal
             commands.append(
-                ("-DateTimeOriginal", current_dto, new_date, "date (overwriting scanner garbage)")
+                ("-EXIF:DateTimeOriginal", current_dto, new_date, "date (overwriting scanner garbage)")
             )
 
-            # Move old date to DateTimeDigitized ONLY if no scan_date in YAML
+            # Move old date to EXIF:CreateDate / XMP:DateTimeDigitized ONLY if no scan_date in YAML
             # If scan_date exists, it takes priority (Bug #4 fix)
             if not has_scan_date:
-                current_dtd = current_exif.get("DateTimeDigitized", "")
+                current_dtd = current_exif.get("EXIF:CreateDate", "")
                 if not current_dtd or is_scanner_trash(current_dtd, threshold):
-                    if current_dto != current_dtd:
+                    if current_dto != current_dtd and not re.match(r"^0000[-:]00[-:]00", current_dto):
                         commands.append(
-                            ("-DateTimeDigitized", current_dtd, current_dto, "scan_date (moved from old garbage)")
+                            ("-EXIF:CreateDate", current_dtd, current_dto, "scan_date (moved from old garbage)")
+                        )
+                        commands.append(
+                            ("-XMP-exif:DateTimeDigitized", current_exif.get("XMP:Subject", ""), current_dto, "scan_date (XMP sync)")
                         )
                 else:
                     logger.info(
@@ -427,21 +477,22 @@ def build_exif_commands(
             if current_dto == new_date:
                 logger.debug("DateTimeOriginal already matches YAML value.")
             else:
-                logger.warning(
-                    f"Scanner DateTimeOriginal ({current_dto}) >= threshold; keeping original. "
+                logger.info(
+                    f"DateTimeOriginal ({current_dto}) looks real (>= threshold); keeping original. "
                     f"YAML date ({new_date}) not applied."
                 )
         else:
             # No existing DateTimeOriginal; write directly
-            commands.append(("-DateTimeOriginal", "", new_date, "date"))
+            commands.append(("-EXIF:DateTimeOriginal", "", new_date, "date"))
 
-    # --- scan_date -> EXIF:DateTimeDigitized ---
+    # --- scan_date -> EXIF:CreateDate + XMP:DateTimeDigitized ---
     scan_date = metadata.get("scan_date")
     if scan_date:
         scan_date_exif = to_exif_datetime(str(scan_date))
-        current_dtd = current_exif.get("DateTimeDigitized", "")
+        current_dtd = current_exif.get("EXIF:CreateDate", "")
         if scan_date_exif != current_dtd:
-            commands.append(("-DateTimeDigitized", current_dtd, scan_date_exif, "scan_date"))
+            commands.append(("-EXIF:CreateDate", current_dtd, scan_date_exif, "scan_date"))
+            commands.append(("-XMP-exif:DateTimeDigitized", current_exif.get("XMP:Subject", ""), scan_date_exif, "scan_date (XMP sync)"))
 
     # --- Build comprehensive UserComment ---
     # NOTE: UserComment is rebuilt from scratch on every run. If you remove a
@@ -450,6 +501,8 @@ def build_exif_commands(
     film = metadata.get("film")
     dev = metadata.get("dev")
     notes = metadata.get("notes")
+    if notes is not None:
+        notes = str(notes).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
     
     # Build UserComment parts
     uc_parts: List[str] = []
@@ -466,19 +519,43 @@ def build_exif_commands(
         new_uc = " | ".join(uc_parts)
         # Only update if the new comprehensive string is different
         if new_uc != current_uc:
-            commands.append(("-UserComment", current_uc, new_uc, "comprehensive metadata"))
+            commands.append(("-EXIF:UserComment", current_uc, new_uc, "comprehensive metadata"))
 
-    # --- film -> IPTC:Keywords (Bug #3 fix: use += for proper keyword separation) ---
+    # --- film -> IPTC:Keywords + XMP-dc:Subject ---
     if film:
         film_str = str(film)
-        current_keywords = current_exif.get("Keywords", "")
-        # Split by ", " and compare exact elements to avoid substring false positives
-        existing_keywords = [kw.strip() for kw in current_keywords.split(", ") if kw.strip()]
-        if film_str not in existing_keywords:
-            # ExifTool: -Keywords+=value adds a keyword (does not create comma-separated string)
-            commands.append(("-Keywords+=", current_keywords, film_str, "film (Keywords)"))
-            # Also write to XMP for maximum Lightroom/Capture One compatibility
-            commands.append(("-XMP-dc:Subject+=", current_keywords, film_str, "film (XMP Subject)"))
+        # Read raw keyword lists from each metadata family.
+        iptc_raw = [kw.strip() for kw in current_exif.get("IPTC:Keywords", "").split("\x00") if kw.strip()]
+        xmp_raw = [kw.strip() for kw in current_exif.get("XMP:Subject", "").split("\x00") if kw.strip()]
+        # Build unified deduplicated list preserving first-seen order.
+        existing_keywords: list[str] = []
+        seen: set[str] = set()
+        for kw in iptc_raw + xmp_raw:
+            if kw not in seen:
+                existing_keywords.append(kw)
+                seen.add(kw)
+
+        needs_rewrite = False
+        if film_str not in seen:
+            needs_rewrite = True
+            final_keywords = existing_keywords + [film_str]
+        else:
+            final_keywords = existing_keywords
+            # Rewrite if either family differs from the desired final list.
+            if iptc_raw != final_keywords or xmp_raw != final_keywords:
+                needs_rewrite = True
+
+        if dedup_mode == "normalize" and needs_rewrite:
+            commands.append(("-IPTC:Keywords=", current_exif.get("IPTC:Keywords", ""), "", "film (clear Keywords)"))
+            for kw in final_keywords:
+                commands.append(("-IPTC:Keywords=", "", kw, "film (Keywords)"))
+            commands.append(("-XMP-dc:Subject=", current_exif.get("XMP:Subject", ""), "", "film (clear XMP Subject)"))
+            for kw in final_keywords:
+                commands.append(("-XMP-dc:Subject=", "", kw, "film (XMP Subject)"))
+        elif film_str not in seen:
+            # Preserve mode (or normalize with no changes needed): only append if absent.
+            commands.append(("-Keywords+=", current_exif.get("IPTC:Keywords", ""), film_str, "film (Keywords)"))
+            commands.append(("-XMP-dc:Subject+=", current_exif.get("XMP:Subject", ""), film_str, "film (XMP Subject)"))
 
     return commands
 
@@ -486,7 +563,25 @@ def build_exif_commands(
 # ---------------------------------------------------------------------------
 # Backup and application
 # ---------------------------------------------------------------------------
-def _backup_single_image(img_path: Path, backup_dir: Path) -> Optional[Path]:
+def _compute_timeout(image_paths: List[Path], override: Optional[int] = None) -> int:
+    """
+    Compute ExifTool timeout. A user override always wins.
+    Otherwise scale by the largest file: base 60s + 1s per MB.
+    """
+    if override is not None:
+        return override
+    max_bytes = 0
+    for p in image_paths:
+        try:
+            size = p.stat().st_size
+            if size > max_bytes:
+                max_bytes = size
+        except OSError:
+            continue
+    return 60 + max(0, max_bytes // (1024 * 1024))
+
+
+def _backup_single_image(img_path: Path, backup_dir: Path, timeout: int = 60) -> Optional[Path]:
     """Backup a single image. Returns img_path on success, None on failure."""
     dest = backup_dir / f"{img_path.name}.exif-backup.json"
     if dest.exists():
@@ -507,7 +602,7 @@ def _backup_single_image(img_path: Path, backup_dir: Path) -> Optional[Path]:
             pass  # Invalid or corrupt, will re-create
 
     try:
-        result = run_exiftool_with_args_file(["-j", "-G", "-b", "-a", str(img_path)], timeout=60)
+        result = run_exiftool_with_args_file(["-j", "-G", "-b", "-a", str(img_path)], timeout=timeout)
         with open(dest, "w", encoding="utf-8") as f:
             f.write(result.stdout)
         logger.debug(f"EXIF backup created: {dest}")
@@ -517,7 +612,7 @@ def _backup_single_image(img_path: Path, backup_dir: Path) -> Optional[Path]:
         return None
 
 
-def ensure_backup(image_paths: List[Path], backup_dir: Path, workers: int = 1) -> List[Path]:
+def ensure_backup(image_paths: List[Path], backup_dir: Path, workers: int = 1, timeout: int = 60) -> List[Path]:
     """
     Create an EXIF-only backup using ExifTool JSON format.
     Returns list of images successfully backed up.
@@ -530,7 +625,7 @@ def ensure_backup(image_paths: List[Path], backup_dir: Path, workers: int = 1) -
         logger.info(f"Backing up with {workers} parallel workers...")
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {
-                ex.submit(_backup_single_image, img, backup_dir): img
+                ex.submit(_backup_single_image, img, backup_dir, timeout): img
                 for img in image_paths
             }
             for fut in as_completed(futures):
@@ -543,17 +638,20 @@ def ensure_backup(image_paths: List[Path], backup_dir: Path, workers: int = 1) -
                     logger.error(f"Backup failed for {img_path}: {exc}")
     else:
         for img_path in image_paths:
-            result = _backup_single_image(img_path, backup_dir)
+            result = _backup_single_image(img_path, backup_dir, timeout)
             if result:
                 backed_up.append(result)
 
     return backed_up
 
 
-def restore_from_backup(folder: Path) -> int:
+def restore_from_backup(folder: Path, timeout: int = 60) -> int:
     """
     Restore EXIF metadata from .film-metadata-injector-backup/ JSON files.
     Returns number of images restored.
+    
+    IMPORTANT: Restore is a merge-overwrite, not a complete rollback. Tags
+    created after the backup (e.g., by other tools) are not removed.
     """
     backup_dir = folder / BACKUP_DIR_NAME
     if not backup_dir.exists():
@@ -577,19 +675,47 @@ def restore_from_backup(folder: Path) -> int:
             continue
 
         try:
-            run_exiftool_with_args_file(
-                ["-j=" + str(backup_file), "-all:all", "-overwrite_original", str(img_path)],
-                timeout=60,
-            )
-            logger.info(f"Restored: {img_name}")
-            restored_count += 1
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            # The JSON stores SourceFile as the absolute path at backup time.
+            # If the folder was moved/renamed, ExifTool ignores the entry.
+            # Rewrite SourceFile to the current path before importing.
+            with open(backup_file, "r", encoding="utf-8") as f:
+                backup_data = json.load(f)
+            if not isinstance(backup_data, list) or not backup_data:
+                logger.warning(f"Invalid backup file, skipping: {backup_file.name}")
+                continue
+            backup_data[0]["SourceFile"] = str(img_path)
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, encoding="utf-8"
+            ) as tmp:
+                json.dump(backup_data, tmp)
+                tmp_path = tmp.name
+
+            try:
+                result = run_exiftool_with_args_file(
+                    ["-j=" + tmp_path, "-overwrite_original", str(img_path)],
+                    timeout=timeout,
+                )
+                if "1 image files updated" in result.stdout or "1 image files unchanged" in result.stdout:
+                    logger.info(f"Restored: {img_name}")
+                    restored_count += 1
+                elif f"No SourceFile '{img_path}' in imported JSON database" in result.stdout:
+                    logger.error(f"Restore failed for {img_name}: SourceFile mismatch")
+                else:
+                    logger.info(f"Restored: {img_name}")
+                    restored_count += 1
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
             logger.error(f"Failed to restore {img_name}: {exc}")
 
     return restored_count
 
 
-def apply_exif_commands(image_path: Path, commands: List[Tuple[str, str, str, str]]) -> bool:
+def apply_exif_commands(image_path: Path, commands: List[Tuple[str, str, str, str]], timeout: int = 60) -> bool:
     """Apply ExifTool commands to an image. Returns True on success."""
     if not commands:
         return True
@@ -601,14 +727,14 @@ def apply_exif_commands(image_path: Path, commands: List[Tuple[str, str, str, st
     for field, _, new_val, _ in commands:
         # Bug A fix: ExifTool operators like += already include = in the field name
         # Don't add another = or we get -Keywords+==value (keyword starts with =)
-        if field.endswith("+=") or field.endswith("-="):
+        if field.endswith("+=") or field.endswith("-=") or field.endswith("="):
             args.append(f"{field}{new_val}")
         else:
             args.append(f"{field}={new_val}")
     args.append(str(image_path))
 
     try:
-        run_exiftool_with_args_file(args, timeout=60)
+        run_exiftool_with_args_file(args, timeout=timeout)
         logger.debug(f"ExifTool OK: {image_path}")
         return True
     except subprocess.CalledProcessError as exc:
@@ -664,10 +790,15 @@ def process_one_image(
     img_path: Path,
     metadata: Dict[str, Any],
     threshold: datetime.date,
-) -> Tuple[Path, List[Tuple[str, str, str, str]]]:
-    """Process a single image and return its commands."""
-    current_exif = get_exif_data(img_path)
-    commands = build_exif_commands(metadata, current_exif, threshold)
+    dedup_mode: str = "normalize",
+    timeout: int = 60,
+) -> Tuple[Path, Optional[List[Tuple[str, str, str, str]]]]:
+    """Process a single image and return its commands (None if EXIF read failed)."""
+    current_exif = get_exif_data(img_path, timeout)
+    if current_exif is None:
+        logger.warning(f"Skipping '{img_path}' due to EXIF read failure.")
+        return img_path, None
+    commands = build_exif_commands(metadata, current_exif, threshold, dedup_mode)
     return img_path, commands
 
 
@@ -677,6 +808,8 @@ def process_folder(
     threshold: datetime.date,
     apply: bool,
     workers: int = 1,
+    timeout_override: Optional[int] = None,
+    dedup_mode: str = "normalize",
 ) -> int:
     """
     Process a single film-roll folder.
@@ -686,6 +819,9 @@ def process_folder(
     if not images:
         logger.info(f"No images found in: {folder}")
         return 0
+
+    timeout = _compute_timeout(images, timeout_override)
+    logger.debug(f"Using ExifTool timeout of {timeout}s for {folder.name}")
 
     # Log date_precision once per folder
     date_precision = metadata.get("date_precision")
@@ -700,12 +836,14 @@ def process_folder(
         logger.info(f"Analyzing with {workers} parallel workers...")
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {
-                ex.submit(process_one_image, img, metadata, threshold): img
+                ex.submit(process_one_image, img, metadata, threshold, dedup_mode, timeout): img
                 for img in images
             }
             for fut in as_completed(futures):
                 try:
                     img_path, commands = fut.result()
+                    if commands is None:
+                        continue
                     if commands:
                         cached_results[img_path] = commands
                         for field, current, new_val, desc in commands:
@@ -716,7 +854,9 @@ def process_folder(
     else:
         for img_path in images:
             try:
-                _, commands = process_one_image(img_path, metadata, threshold)
+                _, commands = process_one_image(img_path, metadata, threshold, dedup_mode, timeout)
+                if commands is None:
+                    continue
                 if commands:
                     cached_results[img_path] = commands
                     for field, current, new_val, desc in commands:
@@ -736,7 +876,7 @@ def process_folder(
 
     # Phase 2: Backup before applying (abort if none succeed)
     backup_dir = folder / BACKUP_DIR_NAME
-    backed_up = ensure_backup(list(cached_results.keys()), backup_dir, workers)
+    backed_up = ensure_backup(list(cached_results.keys()), backup_dir, workers, timeout)
     if not backed_up:
         logger.error(f"No backups created for {folder}. Aborting to prevent data loss.")
         return 0
@@ -761,7 +901,7 @@ def process_folder(
         logger.info(f"Applying with {workers} parallel workers...")
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {
-                ex.submit(apply_exif_commands, img_path, commands): img_path
+                ex.submit(apply_exif_commands, img_path, commands, timeout): img_path
                 for img_path, commands in images_to_apply.items()
             }
             for fut in as_completed(futures):
@@ -776,7 +916,7 @@ def process_folder(
     else:
         for img_path, commands in images_to_apply.items():
             try:
-                if apply_exif_commands(img_path, commands):
+                if apply_exif_commands(img_path, commands, timeout):
                     modified_count += 1
                     logger.info(f"Applied: {img_path.name}")
             except Exception as exc:
@@ -847,6 +987,20 @@ def parse_cli_args() -> argparse.Namespace:
         help="Restore EXIF from backups in .film-metadata-injector-backup/ folders",
     )
     parser.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="Override ExifTool timeout in seconds. Default scales by file size (60s + 1s/MB).",
+    )
+    parser.add_argument(
+        "--dedup-mode",
+        type=str,
+        choices=["preserve", "normalize"],
+        default="normalize",
+        help="Keyword deduplication mode. 'preserve' only appends if absent; "
+             "'normalize' rewrites keyword lists to remove duplicates. Default: normalize",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -902,7 +1056,9 @@ def main() -> None:
         for folder in target_folders:
             backup_dir = folder / BACKUP_DIR_NAME
             if backup_dir.exists():
-                restored = restore_from_backup(folder)
+                images = get_image_files(folder)
+                timeout = _compute_timeout(images, args.timeout)
+                restored = restore_from_backup(folder, timeout)
                 total_restored += restored
         
         logger.info(f"Total images restored: {total_restored}")
@@ -944,7 +1100,7 @@ def main() -> None:
                 )
                 metadata.pop(date_field, None)
 
-        modified = process_folder(folder, metadata, threshold, args.apply, args.workers)
+        modified = process_folder(folder, metadata, threshold, args.apply, args.workers, args.timeout, args.dedup_mode)
         total_modified += modified
 
     action = "applied" if args.apply else "detected (dry-run)"

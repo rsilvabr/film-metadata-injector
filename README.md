@@ -2,6 +2,8 @@
 
 CLI tool that injects analog film metadata—read from `film-metadata.yaml` or `film-metadata.ini` files—directly into the EXIF/IPTC/XMP of scanned photos (JPEG/TIFF).
 
+> **Note on restore:** The built-in restore is a **merge-overwrite** of the tags captured in the backup, not a complete rollback. Tags created after the backup (by other tools or by this script before a later fix) are not removed. For full archival safety, keep separate full-file backups.
+
 ## The Problem
 
 Film scanners (Nikon Coolscan, Epson, Plustek, etc.) often write nonsensical dates into the `DateTimeOriginal` field of scanned images. A photo shot in 2022 may appear in Lightroom as `2001:01:01` because the scanner's internal clock was never set.
@@ -77,9 +79,9 @@ See the `examples/` folder for ready-to-use templates.
 |----------------|-----------------------|----------|
 | `camera_make` | `EXIF:Make` | Overwrite if different. Old scanner Make/Model saved in `UserComment`. |
 | `camera_model` | `EXIF:Model` | Overwrite if different. Old scanner Make/Model saved in `UserComment`. |
-| `film` | `EXIF:UserComment` + `IPTC:Keywords` (flat) | Part of comprehensive `UserComment` string |
+| `film` | `EXIF:UserComment` + `IPTC:Keywords` + `XMP-dc:Subject` | Part of comprehensive `UserComment` string; also added as a keyword. Deduplication mode selectable via `--dedup-mode`. |
 | `date` | `EXIF:DateTimeOriginal` | **Special scanner logic** (see below) |
-| `scan_date` | `EXIF:DateTimeDigitized` | Overwrite if different |
+| `scan_date` | `EXIF:CreateDate` + `XMP-exif:DateTimeDigitized` | Overwrite if different; kept in sync between EXIF and XMP |
 | `lens` | `EXIF:LensModel` | Overwrite if different |
 | `iso` | `EXIF:ISO` | Overwrite if different |
 | `dev`, `notes` | `EXIF:UserComment` | Part of comprehensive `UserComment` string |
@@ -92,9 +94,9 @@ This is the most important behavior of the script:
 1. If the image already has a `DateTimeOriginal` and it is **before the threshold** (default: `2015-01-01`), we treat it as **scanner garbage**.
 2. In that case:
    - Overwrite `DateTimeOriginal` with the date from the YAML file.
-   - Move the old (garbage) date to `DateTimeDigitized` **only if** `DateTimeDigitized` is empty or also garbage.
-   - If `DateTimeDigitized` already exists and is `>= threshold` (a real scan date), **we preserve it** and do not touch it.
-3. If the scanner's `DateTimeOriginal` is `>= threshold`, or if there is no `date` in the YAML: **keep the original** and log a warning.
+   - Move the old (garbage) date to `EXIF:CreateDate` (the ExifTool name for `DateTimeDigitized`) and `XMP-exif:DateTimeDigitized` **only if** both are empty or also garbage, and the old date is not all zeros (`0000:00:00`).
+   - If `CreateDate`/`DateTimeDigitized` already exists and is `>= threshold` (a real scan date), **we preserve it** and do not touch it.
+3. If the scanner's `DateTimeOriginal` is `>= threshold`, or if there is no `date` in the YAML: **keep the original** and log an informational message.
 4. If `date` is missing or `date_precision: unknown`: **do not touch** `DateTimeOriginal`.
 
 ### Comprehensive UserComment Format
@@ -172,6 +174,7 @@ python film_metadata_injector.py /path/to/folder \
   --recursive \
   --workers 4 \
   --scanner-threshold 2015-01-01 \
+  --timeout 300 \
   --verbose
 ```
 
@@ -181,6 +184,8 @@ python film_metadata_injector.py /path/to/folder \
 | `--recursive` | Recursively process subfolders; each folder with its own metadata file. |
 | `--workers` | Number of parallel workers for EXIF writing. Default: `1` (sequential). Use `4-8` for faster processing on SSDs. |
 | `--scanner-threshold` | Date threshold for treating scanner dates as garbage. Default: `2015-01-01`. |
+| `--timeout` | ExifTool timeout in seconds. Default scales with file size (60s + 1s/MB). |
+| `--dedup-mode` | Keyword handling: `preserve` only appends if absent; `normalize` (default) rewrites IPTC/XMP keyword lists to remove duplicates and keep both in sync. |
 | `--verbose` | Enable debug logging. |
 
 ### Recursive Processing
@@ -247,18 +252,18 @@ python film_metadata_injector.py /path/to/folder --restore
 python film_metadata_injector.py /path/to/folder --restore --recursive
 ```
 
-**Note:** Restore uses `-all:all` which attempts to write all tags. Read-only tags (FileSize, ImageWidth, etc.) are ignored by ExifTool but may generate warnings.
+**Note:** Restore is a **merge-overwrite**, not a complete rollback. Tags created after the backup (by other tools or by this script) are not removed. The script rewrites the stored `SourceFile` path internally so restores still work after the folder is renamed or moved.
 
 Or manually with ExifTool:
 
 ```bash
 # Restore single image
-exiftool -j=.film-metadata-injector-backup/photo_001.jpg.exif-backup.json -all:all photo_001.jpg
+exiftool -j=.film-metadata-injector-backup/photo_001.jpg.exif-backup.json photo_001.jpg
 
 # Restore all images in a folder
 for file in .film-metadata-injector-backup/*.json; do
   img=$(basename "$file" .exif-backup.json)
-  exiftool -j="$file" -all:all "$img"
+  exiftool -j="$file" "$img"
 done
 ```
 
@@ -271,7 +276,7 @@ Other formats are skipped with a warning.
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+
 - ExifTool installed and on PATH
 - `pyyaml` (to read `.yaml`)
 - `rich` (optional, for colored dry-run tables)
@@ -284,7 +289,7 @@ Other formats are skipped with a warning.
 | File        | Field            | Current    | New            | Description                   |
 |-------------|------------------|------------|----------------|-------------------------------|
 | photo_01.jpg| DateTimeOriginal | 2001:01:01 | 2022:08:15     | date (overwriting scanner garbage) |
-| photo_01.jpg| DateTimeDigitized|            | 2001:01:01     | scan_date (moved from old garbage) |
+| photo_01.jpg| CreateDate       |            | 2001:01:01     | scan_date (moved from old garbage) |
 | photo_01.jpg| Make             |            | Nikon          | camera_make                   |
 | photo_01.jpg| Model            |            | F3             | camera_model                  |
 | photo_01.jpg| ISO              |            | 400            | iso                           |

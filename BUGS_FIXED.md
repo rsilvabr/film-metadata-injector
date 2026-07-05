@@ -389,4 +389,248 @@ Bugs #8, #9, and #16 were previously documented as fixed in Round 1 but were nev
 | #26 | LOW | `-q` only passed when NOT in verbose/debug mode |
 | #27 | LOW | Added warning log when `parse_date()` fails to parse a date |
 
+---
+
+## Round 4 — External Audit Fixes
+
+This round addresses bugs found during a real-world integration audit using ExifTool 12.76 and actual scanned images with Noritsu scanner EXIF data.
+
+### Bug #28: `DateTimeDigitized` logic used wrong tag name for read and write
+**Severity:** CRITICAL  
+**Location:** `get_exif_data()`, `build_exif_commands()`
+
+**What it did:**
+ExifTool exposes the EXIF `DateTimeDigitized` tag as `CreateDate`. The script read the JSON key `DateTimeDigitized` (which ExifTool never emits for EXIF) and wrote `-DateTimeDigitized=`, which targeted XMP instead of EXIF. This caused:
+- The "preserve real scan date" rule to never fire.
+- `scan_date` to be written to XMP only, leaving EXIF `CreateDate` empty.
+- Contradictory metadata when both EXIF and XMP dates existed.
+
+**Fix:**
+- Read `EXIF:CreateDate` explicitly.
+- Write `-EXIF:CreateDate=` for the EXIF tag.
+- Synchronize `-XMP-exif:DateTimeDigitized=` so both stores stay consistent.
+
+---
+
+### Bug #29: `--restore` silently failed after folder rename/move
+**Severity:** HIGH  
+**Location:** `restore_from_backup()`
+
+**What it did:**
+The backup JSON stores `SourceFile` as the absolute path at backup time. ExifTool's `-j=` import skips entries whose `SourceFile` does not match the target image. After renaming the folder, the import did nothing but exited 0, and the script still counted the image as restored.
+
+**Fix:**
+- Before importing, load the backup JSON, rewrite `SourceFile` to the current image path, and pass this temporary JSON to ExifTool.
+- Also parse ExifTool's stdout to confirm the image was actually updated/unchanged.
+
+---
+
+### Bug #30: Restore was merge-overwrite, not rollback
+**Severity:** HIGH  
+**Location:** `restore_from_backup()`, documentation
+
+**What it did:**
+Importing a JSON backup only overwrites tags present in the backup. Tags created later (for example, the XMP `DateTimeDigitized` written due to Bug #28) survived the restore.
+
+**Fix:**
+- Documented honestly that restore is a merge-overwrite, not a complete rollback.
+- Removed the invalid `-all:all` argument from restore commands.
+
+---
+
+### Bug #31: EXIF read errors were treated as "no metadata"
+**Severity:** MEDIUM  
+**Location:** `get_exif_data()`, `process_one_image()`
+
+**What it did:**
+`get_exif_data()` returned `{}` on timeout/error. `build_exif_commands` then treated the image as having no metadata and wrote values without the scanner-trash protections.
+
+**Fix:**
+- `get_exif_data()` now returns `None` on failure.
+- `process_one_image()` skips the image and logs a warning.
+
+---
+
+### Bug #32: Keyword deduplication ignored XMP `Subject`
+**Severity:** MEDIUM  
+**Location:** `build_exif_commands()`
+
+**What it did:**
+The duplicate check only looked at `Keywords` (IPTC). Files with `XMP-dc:Subject` but no IPTC keywords received duplicate film keywords.
+
+**Fix:**
+- Collect existing keywords from both `IPTC:Keywords` and `XMP:Subject`.
+- Added `--dedup-mode preserve|normalize`:
+  - `preserve`: only appends if the film is absent from both lists.
+  - `normalize` (default): rewrites both lists to a unified, deduplicated set, adding the film if missing.
+
+---
+
+### Bug #33: Fixed 60-second timeout was too short for large TIFFs
+**Severity:** MEDIUM  
+**Location:** all `run_exiftool_with_args_file()` callers
+
+**What it did:**
+TIFF scans of 200–500 MB on slow storage could exceed the hard-coded 60s timeout, causing failed writes or backup operations.
+
+**Fix:**
+- Default timeout scales with the largest file: `60s + 1s per MB`.
+- Added `--timeout` CLI flag to override the calculated value.
+
+---
+
+### Bug #34: `-all:all` was an invalid ExifTool option in restore context
+**Severity:** LOW  
+**Location:** `restore_from_backup()`, README
+
+**What it did:**
+`-all:all` produced the ExifTool warning `Ignored superfluous tag name or invalid option: -all:all`. The restore worked only because `-j=` does the work alone.
+
+**Fix:**
+- Removed `-all:all` from the script and updated manual restore examples in README.
+
+---
+
+### Bug #35: README claimed Python 3.8+ but code used `removesuffix()`
+**Severity:** LOW  
+**Location:** README.md
+
+**Fix:**
+- Updated requirement to Python 3.9+.
+
+---
+
+### Bug #36: `0000:00:00` scanner dates were moved to `DateTimeDigitized`
+**Severity:** LOW  
+**Location:** `build_exif_commands()`
+
+**Fix:**
+- All-zero dates are now treated as garbage and discarded, not moved to history.
+
+---
+
+### Bug #37: Re-runs produced misleading warnings when real `DateTimeOriginal` existed
+**Severity:** LOW  
+**Location:** `build_exif_commands()`
+
+**Fix:**
+- Changed log level from `warning` to `info` and clarified the message.
+
+---
+
+### Bug #38: Newlines in `notes` broke idempotence
+**Severity:** LOW  
+**Location:** `build_exif_commands()`
+
+**What it did:**
+`notes` was sanitized to spaces only when writing to the arg file, but the comparison with `current_uc` used the raw value, so every re-run rewrote `UserComment`.
+
+**Fix:**
+- Normalize newlines to spaces before building and comparing the new `UserComment`.
+
+---
+
+### Bug #39: YAML 1.1 interpreted `dev: NO` / `Off` as booleans
+**Severity:** LOW  
+**Location:** `parse_yaml()`
+
+**Fix:**
+- Detect boolean values that came from YAML 1.1 aliases and convert them back to the original strings `"NO"` / `"YES"`.
+
+---
+
+### Bug #40: INI inline comments corrupted values
+**Severity:** LOW  
+**Location:** `parse_ini()`
+
+**What it did:**
+`iso=400 ; comment` was parsed as `iso=400 ; comment` (value included the comment text).
+
+**Fix:**
+- Strip inline comments starting with ` ;` or ` #` after the key/value has been identified, while preserving standalone comment lines.
+
+---
+
+### Bug #41: Tags used for decisions were ambiguous between EXIF and XMP
+**Severity:** LOW  
+**Location:** `get_exif_data()`
+
+**Fix:**
+- Request decision tags with explicit group prefixes (`-EXIF:Make`, `-EXIF:DateTimeOriginal`, `-IPTC:Keywords`, `-XMP-dc:Subject`, etc.) so values come from the intended metadata family.
+
+---
+
+### Bug #42: `to_exif_datetime` was defined before `parse_date`
+**Severity:** LOW  
+**Location:** module level
+
+**Fix:**
+- Reordered definitions so `parse_date` is defined before `to_exif_datetime` uses it.
+
+---
+
+### Bug #43: `parse_date` regex did not accept ISO `T` separator or compact timezone
+**Severity:** LOW  
+**Location:** `parse_date()`
+
+**Fix:**
+- Updated `DATE_PATTERN` to accept `T` as date/time separator and timezone offsets with or without colon.
+- Added `%Y-%m-%dT%H:%M:%S` and `%Y-%m-%dT%H:%M:%S.%f` to `parse_date` formats.
+
+---
+
+### Bug #44: `get_exif_data` ignored calculated timeout during analysis
+**Severity:** MEDIUM  
+**Location:** `get_exif_data()`, `process_one_image()`, `process_folder()`
+
+**Fix:**
+- Added `timeout` parameter to `get_exif_data` and `process_one_image`.
+- `process_folder` now passes the calculated timeout to the analysis phase.
+
+---
+
+### Bug #45: Keyword normalization produced comma-separated single keywords
+**Severity:** MEDIUM  
+**Location:** `build_exif_commands()` keyword handling
+
+**Fix:**
+- In `normalize` mode, clear each keyword family and re-add keywords one at a time with `-IPTC:Keywords=` and `-XMP-dc:Subject=`, preventing ExifTool from concatenating them into a single comma-separated keyword.
+
+---
+
+### Bug #46: YAML 1.1 boolean fix was unreliable
+**Severity:** LOW  
+**Location:** `parse_yaml()`
+
+**Fix:**
+- Replaced the post-load boolean detection with a custom `SafeLoader` subclass that registers `tag:yaml.org,2002:bool` to return the raw string value, preserving `NO`, `OFF`, `YES`, `ON` literally.
+
+---
+
+## Summary
+
+### Round 4
+
+| Bug | Severity | Fixed |
+|-----|----------|-------|
+| #28 | CRITICAL | `CreateDate` used for EXIF DateTimeDigitized; XMP synchronized |
+| #29 | HIGH | Restore rewrites `SourceFile` before importing |
+| #30 | HIGH | Restore documented as merge-overwrite; `-all:all` removed |
+| #31 | MEDIUM | `get_exif_data()` returns `None` on failure; image skipped |
+| #32 | MEDIUM | Keyword dedup checks IPTC + XMP; `--dedup-mode` added |
+| #33 | MEDIUM | Auto-scaling timeout + `--timeout` flag |
+| #34 | LOW | Removed invalid `-all:all` from restore |
+| #35 | LOW | README requires Python 3.9+ |
+| #36 | LOW | All-zero dates discarded instead of moved |
+| #37 | LOW | Real-date message downgraded from warning to info |
+| #38 | LOW | Newlines normalized before UserComment comparison |
+| #39 | LOW | YAML 1.1 boolean aliases converted back to strings |
+| #40 | LOW | INI inline comments stripped correctly |
+| #41 | LOW | Explicit group prefixes on decision tags |
+| #42 | LOW | `parse_date` defined before `to_exif_datetime` |
+| #43 | LOW | `DATE_PATTERN` accepts `T` separator and compact timezone |
+| #44 | MEDIUM | Timeout propagated to EXIF read/analysis phase |
+| #45 | MEDIUM | Keyword normalization avoids comma-separated single keyword |
+| #46 | LOW | Custom YAML SafeLoader keeps YES/NO/ON/OFF as strings |
+
 **Note on Bug #4:** The semantic change from "invalid date = garbage" to "invalid date = unknown" prevents accidental overwrites of real dates in non-standard formats. A warning is now logged when this happens, so users know the date was skipped intentionally.
