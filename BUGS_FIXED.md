@@ -607,6 +607,44 @@ TIFF scans of 200–500 MB on slow storage could exceed the hard-coded 60s timeo
 
 ---
 
+### Bug #47: INI inline-comment stripping truncated values containing `#`
+**Severity:** MEDIUM  
+**Location:** `parse_ini()`
+
+**What it did:**
+The fix for inline comments stripped both ` ;` and ` #`. Because film notes commonly contain `#` (e.g., `notes=Test roll #3 half-frame`), the value was silently truncated to `Test roll`.
+
+**Fix:**
+- Removed `#` from inline-comment stripping. Only ` ;` (classic INI convention) is treated as an inline comment delimiter.
+
+---
+
+### Bug #48: XMP `DateTimeDigitized` was not read or compared during sync
+**Severity:** MEDIUM  
+**Location:** `get_exif_data()`, `build_exif_commands()`
+
+**What it did:**
+The script synchronized `EXIF:CreateDate` with `XMP-exif:DateTimeDigitized`, but it never read the existing XMP value. The dry-run table showed the current XMP `Subject`/keywords instead. As a result, if `EXIF:CreateDate` already matched `scan_date` but the XMP value diverged (e.g., legacy garbage), the XMP value was never corrected.
+
+**Fix:**
+- Added `-XMP-exif:DateTimeDigitized` to the explicit read tags.
+- The "current" value for sync commands now uses the real XMP `DateTimeDigitized`.
+- `scan_date` logic rewrites both EXIF and XMP if either differs from the target value.
+
+---
+
+### Bug #49: No built-in way to clean up legacy XMP DateTimeDigitized garbage
+**Severity:** LOW  
+**Location:** CLI / `build_exif_commands()`
+
+**What it did:**
+Files processed by older script versions could carry an incorrect `XMP-exif:DateTimeDigitized` value. Restore is merge-overwrite and therefore did not remove it, and the normal sync logic only rewrote the tag when it differed from `scan_date`.
+
+**Fix:**
+- Added `--cleanup-xmp-dtd` flag. When set, the script removes `XMP-exif:DateTimeDigitized` from all images in the processed folders. Users can then re-run normal injection with `scan_date` in the YAML to repopulate both EXIF and XMP correctly.
+
+---
+
 ## Summary
 
 ### Round 4
@@ -632,5 +670,8 @@ TIFF scans of 200–500 MB on slow storage could exceed the hard-coded 60s timeo
 | #44 | MEDIUM | Timeout propagated to EXIF read/analysis phase |
 | #45 | MEDIUM | Keyword normalization avoids comma-separated single keyword |
 | #46 | LOW | Custom YAML SafeLoader keeps YES/NO/ON/OFF as strings |
+| #47 | MEDIUM | INI inline-comment stripping no longer truncates `#` in values |
+| #48 | MEDIUM | XMP DateTimeDigitized read explicitly and compared during sync |
+| #49 | LOW | Added `--cleanup-xmp-dtd` flag for legacy cleanup |
 
 **Note on Bug #4:** The semantic change from "invalid date = garbage" to "invalid date = unknown" prevents accidental overwrites of real dates in non-standard formats. A warning is now logged when this happens, so users know the date was skipped intentionally.

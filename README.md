@@ -186,6 +186,7 @@ python film_metadata_injector.py /path/to/folder \
 | `--scanner-threshold` | Date threshold for treating scanner dates as garbage. Default: `2015-01-01`. |
 | `--timeout` | ExifTool timeout in seconds. Default scales with file size (60s + 1s/MB). |
 | `--dedup-mode` | Keyword handling: `preserve` only appends if absent; `normalize` (default) rewrites IPTC/XMP keyword lists to remove duplicates and keep both in sync. |
+| `--cleanup-xmp-dtd` | Remove legacy `XMP-exif:DateTimeDigitized` values. Useful for cleaning up files processed by older script versions. |
 | `--verbose` | Enable debug logging. |
 
 ### Recursive Processing
@@ -254,6 +255,8 @@ python film_metadata_injector.py /path/to/folder --restore --recursive
 
 **Note:** Restore is a **merge-overwrite**, not a complete rollback. Tags created after the backup (by other tools or by this script) are not removed. The script rewrites the stored `SourceFile` path internally so restores still work after the folder is renamed or moved.
 
+> For legacy cleanup of stale `XMP-exif:DateTimeDigitized` values, see `--cleanup-xmp-dtd` below.
+
 Or manually with ExifTool:
 
 ```bash
@@ -266,6 +269,22 @@ for file in .film-metadata-injector-backup/*.json; do
   exiftool -j="$file" "$img"
 done
 ```
+
+### Cleaning up legacy XMP DateTimeDigitized
+
+If you processed files with an older version of this script, they may contain an incorrect `XMP-exif:DateTimeDigitized` value (for example, scanner garbage that was written to XMP but not EXIF). The built-in restore will not remove it because restore is a merge-overwrite.
+
+To clean it up:
+
+```bash
+# Dry-run first
+python film_metadata_injector.py /path/to/folder --cleanup-xmp-dtd
+
+# Apply cleanup
+python film_metadata_injector.py /path/to/folder --cleanup-xmp-dtd --apply
+```
+
+This removes the legacy `XMP-exif:DateTimeDigitized` tag from all images in the folder. You usually want to re-run the normal metadata injection afterwards (with `scan_date` in your YAML) so both EXIF and XMP are populated correctly.
 
 ## Supported Formats
 

@@ -268,11 +268,11 @@ def parse_ini(path: Path) -> Dict[str, str]:
                 stripped = line.strip()
                 if not stripped or stripped.startswith("#") or stripped.startswith(";"):
                     continue
-                # Remove inline comment starting with " ;" or " #" to avoid
-                # accidentally splitting values that contain those characters.
-                for marker in (" ;", " #"):
-                    if marker in stripped:
-                        stripped = stripped.split(marker, 1)[0].rstrip()
+                # Remove inline comment starting with " ;" (classic INI convention).
+                # We deliberately do NOT strip " #" because film notes commonly
+                # contain "#" (e.g., "roll #3 half-frame").
+                if " ;" in stripped:
+                    stripped = stripped.split(" ;", 1)[0].rstrip()
                 if "=" not in stripped:
                     logger.warning(
                         f"Line {line_no} skipped in '{path}' (no '='): {line.strip()}"
@@ -336,6 +336,7 @@ def get_exif_data(image_path: Path, timeout: int = 60) -> Optional[Dict[str, str
         "-EXIF:UserComment",
         "-IPTC:Keywords",
         "-XMP-dc:Subject",
+        "-XMP-exif:DateTimeDigitized",
     ]
     try:
         result = run_exiftool_with_args_file(
@@ -465,8 +466,9 @@ def build_exif_commands(
                         commands.append(
                             ("-EXIF:CreateDate", current_dtd, current_dto, "scan_date (moved from old garbage)")
                         )
+                        current_xmp_dtd = current_exif.get("XMP:DateTimeDigitized", "")
                         commands.append(
-                            ("-XMP-exif:DateTimeDigitized", current_exif.get("XMP:Subject", ""), current_dto, "scan_date (XMP sync)")
+                            ("-XMP-exif:DateTimeDigitized", current_xmp_dtd, current_dto, "scan_date (XMP sync)")
                         )
                 else:
                     logger.info(
@@ -490,9 +492,17 @@ def build_exif_commands(
     if scan_date:
         scan_date_exif = to_exif_datetime(str(scan_date))
         current_dtd = current_exif.get("EXIF:CreateDate", "")
-        if scan_date_exif != current_dtd:
+        current_xmp_dtd = current_exif.get("XMP:DateTimeDigitized", "")
+        if scan_date_exif != current_dtd or scan_date_exif != current_xmp_dtd:
             commands.append(("-EXIF:CreateDate", current_dtd, scan_date_exif, "scan_date"))
-            commands.append(("-XMP-exif:DateTimeDigitized", current_exif.get("XMP:Subject", ""), scan_date_exif, "scan_date (XMP sync)"))
+            commands.append(("-XMP-exif:DateTimeDigitized", current_xmp_dtd, scan_date_exif, "scan_date (XMP sync)"))
+
+    # --- Optional cleanup of legacy XMP DateTimeDigitized ---
+    cleanup_xmp_dtd = metadata.get("cleanup_xmp_dtd")
+    if cleanup_xmp_dtd:
+        current_xmp_dtd = current_exif.get("XMP:DateTimeDigitized", "")
+        if current_xmp_dtd:
+            commands.append(("-XMP-exif:DateTimeDigitized=", current_xmp_dtd, "", "cleanup legacy XMP DateTimeDigitized"))
 
     # --- Build comprehensive UserComment ---
     # NOTE: UserComment is rebuilt from scratch on every run. If you remove a
@@ -792,12 +802,16 @@ def process_one_image(
     threshold: datetime.date,
     dedup_mode: str = "normalize",
     timeout: int = 60,
+    cleanup_xmp_dtd: bool = False,
 ) -> Tuple[Path, Optional[List[Tuple[str, str, str, str]]]]:
     """Process a single image and return its commands (None if EXIF read failed)."""
     current_exif = get_exif_data(img_path, timeout)
     if current_exif is None:
         logger.warning(f"Skipping '{img_path}' due to EXIF read failure.")
         return img_path, None
+    # Inject cleanup flag into metadata for build_exif_commands
+    metadata = dict(metadata)
+    metadata["cleanup_xmp_dtd"] = cleanup_xmp_dtd
     commands = build_exif_commands(metadata, current_exif, threshold, dedup_mode)
     return img_path, commands
 
@@ -810,6 +824,7 @@ def process_folder(
     workers: int = 1,
     timeout_override: Optional[int] = None,
     dedup_mode: str = "normalize",
+    cleanup_xmp_dtd: bool = False,
 ) -> int:
     """
     Process a single film-roll folder.
@@ -836,7 +851,7 @@ def process_folder(
         logger.info(f"Analyzing with {workers} parallel workers...")
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {
-                ex.submit(process_one_image, img, metadata, threshold, dedup_mode, timeout): img
+                ex.submit(process_one_image, img, metadata, threshold, dedup_mode, timeout, cleanup_xmp_dtd): img
                 for img in images
             }
             for fut in as_completed(futures):
@@ -854,7 +869,7 @@ def process_folder(
     else:
         for img_path in images:
             try:
-                _, commands = process_one_image(img_path, metadata, threshold, dedup_mode, timeout)
+                _, commands = process_one_image(img_path, metadata, threshold, dedup_mode, timeout, cleanup_xmp_dtd)
                 if commands is None:
                     continue
                 if commands:
@@ -1001,6 +1016,12 @@ def parse_cli_args() -> argparse.Namespace:
              "'normalize' rewrites keyword lists to remove duplicates. Default: normalize",
     )
     parser.add_argument(
+        "--cleanup-xmp-dtd",
+        action="store_true",
+        help="Remove legacy XMP-exif:DateTimeDigitized values. "
+             "Useful for cleaning up files processed by older script versions.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -1100,7 +1121,7 @@ def main() -> None:
                 )
                 metadata.pop(date_field, None)
 
-        modified = process_folder(folder, metadata, threshold, args.apply, args.workers, args.timeout, args.dedup_mode)
+        modified = process_folder(folder, metadata, threshold, args.apply, args.workers, args.timeout, args.dedup_mode, args.cleanup_xmp_dtd)
         total_modified += modified
 
     action = "applied" if args.apply else "detected (dry-run)"
