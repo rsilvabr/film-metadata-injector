@@ -119,7 +119,7 @@ The script handles paths with brackets `[ ]`, Japanese characters, spaces, and o
 
 Tested with paths like:
 ```
-E:\film\230309_FilmBW_fomapan100_fx39_梅_野村さん小林さん
+E:\film\230309_FilmBW_fomapan100_fx39_梅
 ```
 
 ## Installation
