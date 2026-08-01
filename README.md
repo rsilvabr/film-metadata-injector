@@ -286,12 +286,14 @@ python film_metadata_injector.py /path/to/folder --cleanup-xmp-dtd --apply
 
 This removes the legacy `XMP-exif:DateTimeDigitized` tag from all images in the folder. You usually want to re-run the normal metadata injection afterwards (with `scan_date` in your YAML) so both EXIF and XMP are populated correctly.
 
+> **Note:** If a folder's YAML already contains `scan_date`, `--cleanup-xmp-dtd` is redundant for that folder — the `scan_date` logic already overwrites the XMP tag. The script will emit a warning explaining this, which is normal and expected when running `--cleanup-xmp-dtd --recursive` across mixed folders.
+
 ## Supported Formats
 
 - JPEG (`.jpg`, `.jpeg`)
 - TIFF (`.tif`, `.tiff`)
 
-Other formats are skipped with a warning.
+Other formats are silently skipped.
 
 ## Requirements
 

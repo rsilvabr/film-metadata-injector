@@ -7,7 +7,7 @@ of scanned photos (JPEG/TIFF).
 Architecture:
     - One folder = one film roll
     - film-metadata.yaml (or .ini) inside the folder defines shared metadata
-    - Only JPEG and TIFF are processed; others are skipped with a warning
+    - Only JPEG and TIFF are processed; others are skipped silently
     - Each folder with metadata is treated as an independent roll
     - No inheritance between parent/child folders
 """
@@ -66,7 +66,7 @@ DEFAULT_SCANNER_THRESHOLD = "2015-01-01"
 # Accepts YAML (YYYY-MM-DD) and EXIF formats with optional time/subsec/timezone
 DATE_PATTERN = re.compile(
     r"^\d{4}[-:]\d{2}[-:]\d{2}"
-    r"(?:[T\s]+\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2})?)?$"
+    r"(?:[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2})?)?$"
 )
 
 
@@ -104,6 +104,12 @@ def to_exif_datetime(date_str: str) -> str:
     ExifTool accepts many date formats, but DateTimeOriginal requires
     the standard EXIF format for reliable writing.
     """
+    # Strip optional timezone offset (Python < 3.7 doesn't support %z with colons)
+    tz_match = re.search(r"([+-]\d{2}):?(\d{2})$", date_str)
+    if tz_match:
+        date_str = date_str[:tz_match.start()]
+    # Normalize ISO T separator to a space so the branches below match
+    date_str = re.sub(r"^(\d{4}[-:]\d{2}[-:]\d{2})T", r"\1 ", date_str)
     # Already in EXIF format (YYYY:MM:DD or YYYY:MM:DD HH:MM:SS or with subseconds)
     if re.match(r"^\d{4}:\d{2}:\d{2}( \d{2}:\d{2}:\d{2}(\.\d+)?)?$", date_str):
         if len(date_str) == 10:
@@ -370,6 +376,7 @@ def build_exif_commands(
     current_exif: Optional[Dict[str, str]],
     threshold: datetime.date,
     dedup_mode: str = "normalize",
+    cleanup_xmp_dtd: bool = False,
 ) -> List[Tuple[str, str, str, str]]:
     """
     Build a list of ExifTool commands from the metadata file.
@@ -498,7 +505,9 @@ def build_exif_commands(
             commands.append(("-XMP-exif:DateTimeDigitized", current_xmp_dtd, scan_date_exif, "scan_date (XMP sync)"))
 
     # --- Optional cleanup of legacy XMP DateTimeDigitized ---
-    cleanup_xmp_dtd = metadata.get("cleanup_xmp_dtd")
+    # NOTE: this is a destructive CLI-only flag; it is never read from the
+    # metadata file, so a YAML/INI value like "cleanup_xmp_dtd: false"
+    # (parsed as a truthy string) cannot trigger accidental deletion.
     if cleanup_xmp_dtd:
         current_xmp_dtd = current_exif.get("XMP:DateTimeDigitized", "")
         if current_xmp_dtd:
@@ -712,8 +721,10 @@ def restore_from_backup(folder: Path, timeout: int = 60) -> int:
                 elif f"No SourceFile '{img_path}' in imported JSON database" in result.stdout:
                     logger.error(f"Restore failed for {img_name}: SourceFile mismatch")
                 else:
-                    logger.info(f"Restored: {img_name}")
-                    restored_count += 1
+                    logger.warning(
+                        f"Unexpected ExifTool output restoring {img_name}: "
+                        f"{result.stdout.strip() or '(empty)'}"
+                    )
             finally:
                 try:
                     os.unlink(tmp_path)
@@ -809,10 +820,7 @@ def process_one_image(
     if current_exif is None:
         logger.warning(f"Skipping '{img_path}' due to EXIF read failure.")
         return img_path, None
-    # Inject cleanup flag into metadata for build_exif_commands
-    metadata = dict(metadata)
-    metadata["cleanup_xmp_dtd"] = cleanup_xmp_dtd
-    commands = build_exif_commands(metadata, current_exif, threshold, dedup_mode)
+    commands = build_exif_commands(metadata, current_exif, threshold, dedup_mode, cleanup_xmp_dtd)
     return img_path, commands
 
 
@@ -825,15 +833,16 @@ def process_folder(
     timeout_override: Optional[int] = None,
     dedup_mode: str = "normalize",
     cleanup_xmp_dtd: bool = False,
-) -> int:
+) -> Tuple[int, int]:
     """
     Process a single film-roll folder.
-    Returns the number of images that were (or would be) modified.
+    Returns (modified, failed): images that were (or would be) modified,
+    and images that failed at any stage (read, backup, or apply).
     """
     images = get_image_files(folder)
     if not images:
         logger.info(f"No images found in: {folder}")
-        return 0
+        return 0, 0
 
     timeout = _compute_timeout(images, timeout_override)
     logger.debug(f"Using ExifTool timeout of {timeout}s for {folder.name}")
@@ -843,8 +852,16 @@ def process_folder(
     if date_precision:
         logger.info(f"date_precision: {date_precision} (not written to EXIF)")
 
+    if cleanup_xmp_dtd and metadata.get("scan_date"):
+        logger.warning(
+            "cleanup_xmp_dtd is redundant for this folder because scan_date is set in the YAML; "
+            "the scan_date rewrite will overwrite XMP DateTimeDigitized. "
+            "This is expected behavior for recursive mixed folders."
+        )
+
     all_changes: List[Tuple[Path, str, str, str, str]] = []
     cached_results: Dict[Path, List[Tuple[str, str, str, str]]] = {}
+    failed_count = 0
 
     # Phase 1: Analysis (parallel if workers > 1)
     if workers > 1 and len(images) > 1:
@@ -858,6 +875,7 @@ def process_folder(
                 try:
                     img_path, commands = fut.result()
                     if commands is None:
+                        failed_count += 1
                         continue
                     if commands:
                         cached_results[img_path] = commands
@@ -866,11 +884,13 @@ def process_folder(
                 except Exception as exc:
                     img_path = futures[fut]
                     logger.error(f"Failed to analyze {img_path}: {exc}")
+                    failed_count += 1
     else:
         for img_path in images:
             try:
                 _, commands = process_one_image(img_path, metadata, threshold, dedup_mode, timeout, cleanup_xmp_dtd)
                 if commands is None:
+                    failed_count += 1
                     continue
                 if commands:
                     cached_results[img_path] = commands
@@ -878,28 +898,30 @@ def process_folder(
                         all_changes.append((img_path, field, current, new_val, desc))
             except Exception as exc:
                 logger.error(f"Failed to analyze {img_path}: {exc}")
+                failed_count += 1
 
     if not all_changes:
         logger.info(f"No changes needed in: {folder}")
-        return 0
+        return 0, failed_count
 
     print_dry_run_table(all_changes)
 
     if not apply:
         logger.info("Dry-run mode. Use --apply to execute changes.")
-        return len(cached_results)
+        return len(cached_results), failed_count
 
     # Phase 2: Backup before applying (abort if none succeed)
     backup_dir = folder / BACKUP_DIR_NAME
     backed_up = ensure_backup(list(cached_results.keys()), backup_dir, workers, timeout)
     if not backed_up:
         logger.error(f"No backups created for {folder}. Aborting to prevent data loss.")
-        return 0
+        return 0, failed_count + len(cached_results)
 
     total_to_modify = len(cached_results)
     backed_count = len(backed_up)
     if backed_count < total_to_modify:
         skipped = total_to_modify - backed_count
+        failed_count += skipped
         logger.warning(
             f"Backup partial: {backed_count}/{total_to_modify} images backed up. "
             f"{skipped} image(s) will be skipped. Check logs above for details."
@@ -925,42 +947,51 @@ def process_folder(
                     if fut.result():
                         modified_count += 1
                         logger.info(f"Applied: {img_path.name}")
+                    else:
+                        failed_count += 1
                 except Exception as exc:
                     img_path = futures[fut]
                     logger.error(f"Failed to apply {img_path}: {exc}")
+                    failed_count += 1
     else:
         for img_path, commands in images_to_apply.items():
             try:
                 if apply_exif_commands(img_path, commands, timeout):
                     modified_count += 1
                     logger.info(f"Applied: {img_path.name}")
+                else:
+                    failed_count += 1
             except Exception as exc:
                 logger.error(f"Failed to apply {img_path}: {exc}")
+                failed_count += 1
 
-    return modified_count
+    return modified_count, failed_count
 
 
 # ---------------------------------------------------------------------------
 # Recursive discovery
 # ---------------------------------------------------------------------------
-def discover_folders(root: Path, recursive: bool) -> List[Path]:
+def discover_folders(root: Path, recursive: bool) -> Dict[Path, Path]:
     """
     Discover folders that contain film-metadata.yaml or film-metadata.ini.
     When recursive=True, also scans subfolders.
     Uses os.walk() for efficiency (avoids creating Path objects for every file).
+    Returns a mapping of folder -> metadata file (avoids re-scanning in main).
     """
-    folders: List[Path] = []
+    folders: Dict[Path, Path] = {}
     if recursive:
         for dirpath, dirnames, _ in os.walk(root):
-            # Skip hidden directories (e.g., .git, __pycache__, .film-metadata-injector-backup)
+            # Skip hidden directories (e.g., .git, .film-metadata-injector-backup)
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             folder = Path(dirpath)
-            if find_metadata_file(folder):
-                folders.append(folder)
+            meta_file = find_metadata_file(folder)
+            if meta_file:
+                folders[folder] = meta_file
     else:
-        if find_metadata_file(root):
-            folders.append(root)
-    return sorted(folders)
+        meta_file = find_metadata_file(root)
+        if meta_file:
+            folders[root] = meta_file
+    return dict(sorted(folders.items()))
 
 
 # ---------------------------------------------------------------------------
@@ -1069,8 +1100,6 @@ def main() -> None:
                 folder = Path(dirpath)
                 _folders.append(folder)
             target_folders = sorted(_folders)
-            if args.path not in target_folders:
-                target_folders.insert(0, args.path)
 
         logger.info(f"Restore mode: scanning {len(target_folders)} folder(s)")
         total_restored = 0
@@ -1095,12 +1124,9 @@ def main() -> None:
 
     logger.info(f"Folders found for processing: {len(target_folders)}")
     total_modified = 0
+    total_failed = 0
 
-    for folder in target_folders:
-        meta_file = find_metadata_file(folder)
-        if meta_file is None:
-            continue  # Defensive; should not happen
-
+    for folder, meta_file in target_folders.items():
         logger.info(f"Processing: {folder} (metadata: {meta_file.name})")
 
         try:
@@ -1121,12 +1147,21 @@ def main() -> None:
                 )
                 metadata.pop(date_field, None)
 
-        modified = process_folder(folder, metadata, threshold, args.apply, args.workers, args.timeout, args.dedup_mode, args.cleanup_xmp_dtd)
+        modified, failed = process_folder(folder, metadata, threshold, args.apply, args.workers, args.timeout, args.dedup_mode, args.cleanup_xmp_dtd)
         total_modified += modified
+        total_failed += failed
 
     action = "applied" if args.apply else "detected (dry-run)"
     logger.info(f"Total images {action}: {total_modified}")
+    if total_failed:
+        logger.error(f"Total images with failures: {total_failed}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        logger.error("Interrupted by user (Ctrl+C).")
+        sys.exit(130)
