@@ -1,0 +1,40 @@
+# =============================================================================
+# film-metadata.yaml — TEMPLATE (fill in and copy to your photo folder)
+# =============================================================================
+# One folder = one film roll. All JPEG/TIFF files in the folder get these
+# values. Empty fields are ignored — just leave them blank if unknown.
+#
+# Quick reference of common values (delete what you don't need):
+#
+#   camera_make / camera_model:
+#     Nikon F3 | Nikon FM2 | Canon AE-1 | Canon EOS-1V | Pentax K1000
+#     Olympus OM-1 | Olympus Pen-F | Leica M6 | Contax T2 | Minolta X-700
+#     Yashica Mat-124G | Hasselblad 500C/M | Mamiya 7 | Rolleiflex 2.8F
+#
+#   film:
+#     Kodak Portra 160 | Kodak Portra 400 | Kodak Portra 800
+#     Kodak Gold 200 | Kodak Ultramax 400 | Kodak Ektar 100
+#     Kodak Tri-X 400 | Kodak T-Max 100/400 | Ilford HP5 Plus 400
+#     Ilford FP4 Plus 125 | Ilford Delta 3200 | Fuji Superia X-TRA 400
+#     Cinestill 800T | Cinestill 400D | Fomapan 100 | Fomapan 400
+#
+#   dev (development process):
+#     C-41 (color negative) | E-6 (slide) | ECN-2 (motion picture)
+#     BW: D-76 | HC-110 | ID-11 | Xtol | Rodinal | FX-39
+#
+#   date_precision: roll | exact | unknown
+#     roll    = date is the roll's approximate date (default behavior)
+#     exact   = you know the exact exposure date
+#     unknown = DateTimeOriginal is left untouched
+# =============================================================================
+
+camera_make:
+camera_model:
+film:
+iso:
+date:              # YYYY-MM-DD (exposure date of the roll)
+date_precision:    # roll | exact | unknown
+lens:
+dev:
+scan_date:         # YYYY-MM-DD (when the roll was scanned)
+notes:

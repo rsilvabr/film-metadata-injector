@@ -4,9 +4,11 @@ Place a `film-metadata.yaml` (or `film-metadata.ini`) file inside each folder co
 
 ## Quick Start
 
-1. Copy `film-metadata.yaml` from this folder into your photo folder
-2. Edit the values to match your film roll
+1. Copy `film-metadata-template.yaml` (or `.ini`) into your photo folder and rename it to `film-metadata.yaml` / `film-metadata.ini`
+2. Fill in the values for your film roll — **empty fields are ignored**, so leave blank what you don't know
 3. Run the injector: `python film_metadata_injector.py /path/to/folder --apply`
+
+The templates include a commented cheat sheet with common cameras, film stocks, and development processes. The files `film-metadata.yaml` / `film-metadata.ini` in this folder are filled examples for reference.
 
 ## Field Reference
 
