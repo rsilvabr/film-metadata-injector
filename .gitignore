@@ -19,3 +19,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Tool output
+.film-metadata-injector-backup/
+.film_metadata_injector_config.json

@@ -21,9 +21,31 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, NoReturn, Optional, Tuple
+
+
+def _configure_stdio_encoding() -> None:
+    """
+    Force UTF-8 on stdout/stderr.
+
+    Without this, printing a filename or a metadata value containing characters
+    outside the console code page (CJK on a cp1252 Windows console, or any
+    redirected/piped output) raises UnicodeEncodeError from deep inside Rich and
+    kills the whole run - including the remaining folders of a --recursive batch.
+    Done at import time because the module-level Console() below and the logging
+    handlers both bind to these streams.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, OSError, ValueError):
+            pass  # Not a reconfigurable text stream; nothing we can do.
+
+
+_configure_stdio_encoding()
 
 try:
     from rich.console import Console
@@ -62,6 +84,27 @@ SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".tif", ".tiff"}
 METADATA_FILENAMES = ["film-metadata.yaml", "film-metadata.yml", "film-metadata.ini"]
 BACKUP_DIR_NAME = ".film-metadata-injector-backup"
 DEFAULT_SCANNER_THRESHOLD = "2015-01-01"
+
+# Every tag this script is allowed to write, mapped from the key it has in the
+# backup JSON (produced by `exiftool -j -G`, i.e. family-0 group names) to the
+# ExifTool argument that DELETES it.
+#
+# --restore uses this to turn a merge into a real rollback: a managed tag that
+# is absent from the backup did not exist before we ran, so restoring means
+# removing it. Tags outside this dict are never deleted - if another tool wrote
+# them, they are none of our business.
+MANAGED_TAGS: Dict[str, str] = {
+    "EXIF:Make": "-EXIF:Make=",
+    "EXIF:Model": "-EXIF:Model=",
+    "EXIF:ISO": "-EXIF:ISO=",
+    "EXIF:LensModel": "-EXIF:LensModel=",
+    "EXIF:DateTimeOriginal": "-EXIF:DateTimeOriginal=",
+    "EXIF:CreateDate": "-EXIF:CreateDate=",
+    "EXIF:UserComment": "-EXIF:UserComment=",
+    "IPTC:Keywords": "-IPTC:Keywords=",
+    "XMP:Subject": "-XMP-dc:Subject=",
+    "XMP:DateTimeDigitized": "-XMP-exif:DateTimeDigitized=",
+}
 
 # Accepts YAML (YYYY-MM-DD) and EXIF formats with optional time/subsec/timezone
 DATE_PATTERN = re.compile(
@@ -104,9 +147,17 @@ def to_exif_datetime(date_str: str) -> str:
     ExifTool accepts many date formats, but DateTimeOriginal requires
     the standard EXIF format for reliable writing.
     """
-    # Strip optional timezone offset (Python < 3.7 doesn't support %z with colons)
+    # Strip optional timezone offset. EXIF DateTimeOriginal has no timezone
+    # field, so the offset cannot be carried over - say so instead of dropping
+    # it silently (YAML parses `2023-05-15T10:30:00+09:00` into a tz-aware
+    # datetime, so this is easy to hit by accident).
     tz_match = re.search(r"([+-]\d{2}):?(\d{2})$", date_str)
     if tz_match:
+        logger.warning(
+            f"Timezone offset '{date_str[tz_match.start():]}' in '{date_str}' is not "
+            "written to EXIF (DateTimeOriginal has no timezone field); "
+            "the local time is used as-is."
+        )
         date_str = date_str[:tz_match.start()]
     # Normalize ISO T separator to a space so the branches below match
     date_str = re.sub(r"^(\d{4}[-:]\d{2}[-:]\d{2})T", r"\1 ", date_str)
@@ -192,8 +243,10 @@ def check_exiftool() -> None:
         error_exit("ExifTool did not respond in time.")
 
 
-# Module-level cache for is_scanner_trash results within a single run
+# Module-level cache for is_scanner_trash results within a single run.
+# Read and written from worker threads, hence the lock.
 _scanner_trash_cache: Dict[Tuple[str, str], bool] = {}
+_scanner_trash_lock = threading.Lock()
 
 
 def is_scanner_trash(date_str: str, threshold: datetime.date) -> bool:
@@ -204,27 +257,28 @@ def is_scanner_trash(date_str: str, threshold: datetime.date) -> bool:
     Results are cached per (date_str, threshold) to avoid duplicate logging.
     """
     cache_key = (date_str, threshold.isoformat())
-    if cache_key in _scanner_trash_cache:
-        return _scanner_trash_cache[cache_key]
+    with _scanner_trash_lock:
+        if cache_key in _scanner_trash_cache:
+            return _scanner_trash_cache[cache_key]
 
-    # Explicitly treat all-zero dates (common scanner sentinel) as garbage
-    if re.match(r"^0000[-:]00[-:]00", date_str):
-        logger.debug(f"All-zero date '{date_str}' treated as scanner garbage.")
-        _scanner_trash_cache[cache_key] = True
-        return True
+        # Explicitly treat all-zero dates (common scanner sentinel) as garbage
+        if re.match(r"^0000[-:]00[-:]00", date_str):
+            logger.debug(f"All-zero date '{date_str}' treated as scanner garbage.")
+            _scanner_trash_cache[cache_key] = True
+            return True
 
-    parsed = parse_date(date_str)
-    if parsed is None:
-        logger.warning(
-            f"Unparseable date '{date_str}', treating as unknown (not garbage). "
-            "If this is a scanner date that should be overwritten, check the format."
-        )
-        _scanner_trash_cache[cache_key] = False
-        return False
+        parsed = parse_date(date_str)
+        if parsed is None:
+            logger.warning(
+                f"Unparseable date '{date_str}', treating as unknown (not garbage). "
+                "If this is a scanner date that should be overwritten, check the format."
+            )
+            _scanner_trash_cache[cache_key] = False
+            return False
 
-    result = parsed < threshold
-    _scanner_trash_cache[cache_key] = result
-    return result
+        result = parsed < threshold
+        _scanner_trash_cache[cache_key] = result
+        return result
 
 
 class MetadataParseError(Exception):
@@ -264,21 +318,19 @@ def parse_yaml(path: Path) -> Dict[str, Any]:
 def parse_ini(path: Path) -> Dict[str, str]:
     """
     Read a simple INI file (key=value, no sections) and return a dictionary.
+
+    A quoted value is taken literally up to its closing quote, so a note such as
+    notes="roll #3 ; half frame" keeps its semicolon. Unquoted values still get
+    the classic " ;" inline-comment treatment.
     """
     data: Dict[str, str] = {}
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
             for line_no, line in enumerate(f, start=1):
-                # Strip inline comments only after a value has started.
-                # Semicolon/colon at the very beginning is still a comment.
+                # A semicolon or hash at the very beginning is a comment line.
                 stripped = line.strip()
                 if not stripped or stripped.startswith("#") or stripped.startswith(";"):
                     continue
-                # Remove inline comment starting with " ;" (classic INI convention).
-                # We deliberately do NOT strip " #" because film notes commonly
-                # contain "#" (e.g., "roll #3 half-frame").
-                if " ;" in stripped:
-                    stripped = stripped.split(" ;", 1)[0].rstrip()
                 if "=" not in stripped:
                     logger.warning(
                         f"Line {line_no} skipped in '{path}' (no '='): {line.strip()}"
@@ -287,9 +339,20 @@ def parse_ini(path: Path) -> Dict[str, str]:
                 key, value = stripped.split("=", 1)
                 key = key.strip()
                 value = value.strip()
-                # Remove surrounding quotes if present (e.g., notes="value" -> value)
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-                    value = value[1:-1]
+
+                quote = value[0] if value[:1] in ('"', "'") else ""
+                closing = value.find(quote, 1) if quote else -1
+                if closing > 0:
+                    # Quoted: the value ends at the closing quote; anything after
+                    # it (typically a comment) is discarded without touching the
+                    # quoted text itself.
+                    value = value[1:closing]
+                else:
+                    # Unquoted: remove an inline comment starting with " ;".
+                    # We deliberately do NOT strip " #" because film notes commonly
+                    # contain "#" (e.g., "roll #3 half-frame").
+                    if " ;" in value:
+                        value = value.split(" ;", 1)[0].rstrip()
                 data[key] = value
         return data
     except OSError as exc:
@@ -429,13 +492,21 @@ def build_exif_commands(
 
     # --- iso -> EXIF:ISO ---
     iso = metadata.get("iso")
-    if iso is not None:
+    if iso is not None and str(iso).strip() != "":
         try:
             iso_val = float(str(iso))
             if iso_val <= 0:
                 logger.warning(f"ISO must be positive, got '{iso}'. Ignoring.")
+            elif iso_val > 65535:
+                # EXIF:ISO is a 16-bit unsigned integer; larger values cannot be
+                # stored and ExifTool would either error or silently mangle them.
+                logger.warning(f"ISO {iso} exceeds the EXIF maximum of 65535. Ignoring.")
             else:
                 iso_int = int(iso_val)
+                if iso_val != iso_int:
+                    logger.warning(
+                        f"ISO '{iso}' is not an integer; using {iso_int} (EXIF:ISO has no decimals)."
+                    )
                 current_iso = current_exif.get("EXIF:ISO", "")
                 if str(iso_int) != current_iso:
                     commands.append(("-EXIF:ISO", current_iso, str(iso_int), "iso"))
@@ -458,7 +529,17 @@ def build_exif_commands(
         new_date = to_exif_datetime(str(date_raw))
         current_dto = current_exif.get("EXIF:DateTimeOriginal", "")
 
-        if current_dto and is_scanner_trash(current_dto, threshold):
+        if current_dto == new_date:
+            # Already exactly what the metadata file asks for - nothing to do.
+            #
+            # This check MUST come before the scanner-garbage test. Analog rolls
+            # are routinely older than the threshold (a roll shot in 1998 with a
+            # 2015 threshold), so on the second run the date we ourselves wrote
+            # would otherwise be re-classified as garbage: the run would never
+            # converge, and the real scanner date parked in CreateDate would be
+            # overwritten with the exposure date.
+            logger.debug("DateTimeOriginal already matches the metadata value.")
+        elif current_dto and is_scanner_trash(current_dto, threshold):
             # Overwrite DateTimeOriginal
             commands.append(
                 ("-EXIF:DateTimeOriginal", current_dto, new_date, "date (overwriting scanner garbage)")
@@ -483,13 +564,10 @@ def build_exif_commands(
                     )
         elif current_dto:
             # Scanner date looks real; keep it and warn
-            if current_dto == new_date:
-                logger.debug("DateTimeOriginal already matches YAML value.")
-            else:
-                logger.info(
-                    f"DateTimeOriginal ({current_dto}) looks real (>= threshold); keeping original. "
-                    f"YAML date ({new_date}) not applied."
-                )
+            logger.info(
+                f"DateTimeOriginal ({current_dto}) looks real (>= threshold); keeping original. "
+                f"YAML date ({new_date}) not applied."
+            )
         else:
             # No existing DateTimeOriginal; write directly
             commands.append(("-EXIF:DateTimeOriginal", "", new_date, "date"))
@@ -500,8 +578,12 @@ def build_exif_commands(
         scan_date_exif = to_exif_datetime(str(scan_date))
         current_dtd = current_exif.get("EXIF:CreateDate", "")
         current_xmp_dtd = current_exif.get("XMP:DateTimeDigitized", "")
-        if scan_date_exif != current_dtd or scan_date_exif != current_xmp_dtd:
+        # Checked per tag: a mismatch in one is no reason to rewrite the other
+        # with the value it already has (a no-op write that still showed up in
+        # the dry-run table as "2024:03:10 -> 2024:03:10").
+        if scan_date_exif != current_dtd:
             commands.append(("-EXIF:CreateDate", current_dtd, scan_date_exif, "scan_date"))
+        if scan_date_exif != current_xmp_dtd:
             commands.append(("-XMP-exif:DateTimeDigitized", current_xmp_dtd, scan_date_exif, "scan_date (XMP sync)"))
 
     # --- Optional cleanup of legacy XMP DateTimeDigitized ---
@@ -509,8 +591,26 @@ def build_exif_commands(
     # metadata file, so a YAML/INI value like "cleanup_xmp_dtd: false"
     # (parsed as a truthy string) cannot trigger accidental deletion.
     if cleanup_xmp_dtd:
+        # ExifTool applies arguments in order, so a deletion appended after a
+        # write to the same tag wins. Emitting both would delete the value the
+        # scan_date logic just set - the exact EXIF/XMP desync this script
+        # exists to prevent - and the two would fight on every re-run.
+        already_written = any(
+            field.startswith("-XMP-exif:DateTimeDigitized") for field, _, _, _ in commands
+        )
         current_xmp_dtd = current_exif.get("XMP:DateTimeDigitized", "")
-        if current_xmp_dtd:
+        if scan_date:
+            # scan_date owns this tag. Checking only `already_written` was not
+            # enough: once the value matches, no write is queued, the cleanup
+            # fires, and the next run puts it back - flapping forever.
+            logger.debug(
+                "Skipping XMP DateTimeDigitized cleanup: scan_date owns that tag."
+            )
+        elif already_written:
+            logger.debug(
+                "Skipping XMP DateTimeDigitized cleanup: this run already writes that tag."
+            )
+        elif current_xmp_dtd:
             commands.append(("-XMP-exif:DateTimeDigitized=", current_xmp_dtd, "", "cleanup legacy XMP DateTimeDigitized"))
 
     # --- Build comprehensive UserComment ---
@@ -547,15 +647,19 @@ def build_exif_commands(
         iptc_raw = [kw.strip() for kw in current_exif.get("IPTC:Keywords", "").split("\x00") if kw.strip()]
         xmp_raw = [kw.strip() for kw in current_exif.get("XMP:Subject", "").split("\x00") if kw.strip()]
         # Build unified deduplicated list preserving first-seen order.
+        # Matching is case-insensitive so a roll re-tagged as "kodak portra 400"
+        # does not pile up next to an existing "Kodak Portra 400"; the casing
+        # already in the file wins, since that is what the user's catalog shows.
         existing_keywords: list[str] = []
         seen: set[str] = set()
         for kw in iptc_raw + xmp_raw:
-            if kw not in seen:
+            if kw.casefold() not in seen:
                 existing_keywords.append(kw)
-                seen.add(kw)
+                seen.add(kw.casefold())
+        film_present = film_str.casefold() in seen
 
         needs_rewrite = False
-        if film_str not in seen:
+        if not film_present:
             needs_rewrite = True
             final_keywords = existing_keywords + [film_str]
         else:
@@ -571,7 +675,7 @@ def build_exif_commands(
             commands.append(("-XMP-dc:Subject=", current_exif.get("XMP:Subject", ""), "", "film (clear XMP Subject)"))
             for kw in final_keywords:
                 commands.append(("-XMP-dc:Subject=", "", kw, "film (XMP Subject)"))
-        elif film_str not in seen:
+        elif not film_present:
             # Preserve mode (or normalize with no changes needed): only append if absent.
             commands.append(("-Keywords+=", current_exif.get("IPTC:Keywords", ""), film_str, "film (Keywords)"))
             commands.append(("-XMP-dc:Subject+=", current_exif.get("XMP:Subject", ""), film_str, "film (XMP Subject)"))
@@ -664,13 +768,32 @@ def ensure_backup(image_paths: List[Path], backup_dir: Path, workers: int = 1, t
     return backed_up
 
 
+def _managed_tags_to_delete(backup_entry: Dict[str, Any]) -> List[str]:
+    """
+    ExifTool delete arguments for every managed tag missing from the backup.
+
+    A tag in MANAGED_TAGS that is absent from the backup did not exist before
+    this script ran, so a faithful restore removes it. Without this step the
+    restore is a merge and leaves most of the injection in place: reverting a
+    typical roll used to bring back Make/Model/DateTimeOriginal while ISO,
+    LensModel, UserComment, CreateDate, Keywords and XMP Subject all stayed.
+    """
+    return [
+        delete_arg
+        for json_key, delete_arg in MANAGED_TAGS.items()
+        if json_key not in backup_entry
+    ]
+
+
 def restore_from_backup(folder: Path, timeout: int = 60) -> int:
     """
     Restore EXIF metadata from .film-metadata-injector-backup/ JSON files.
     Returns number of images restored.
-    
-    IMPORTANT: Restore is a merge-overwrite, not a complete rollback. Tags
-    created after the backup (e.g., by other tools) are not removed.
+
+    Two passes per image: the backup JSON is imported (restoring every tag it
+    holds, replacing list tags outright), then the managed tags that the backup
+    does NOT hold are deleted. Tags outside MANAGED_TAGS are left alone, so
+    metadata written by other tools survives.
     """
     backup_dir = folder / BACKUP_DIR_NAME
     if not backup_dir.exists():
@@ -715,15 +838,27 @@ def restore_from_backup(folder: Path, timeout: int = 60) -> int:
                     ["-j=" + tmp_path, "-overwrite_original", str(img_path)],
                     timeout=timeout,
                 )
-                if "1 image files updated" in result.stdout or "1 image files unchanged" in result.stdout:
+                # ExifTool prints its "N image files updated" summary on STDERR,
+                # not stdout - checking stdout alone reported "0 restored" and a
+                # warning for every image even when the restore fully succeeded.
+                output = (result.stdout or "") + (result.stderr or "")
+                if "1 image files updated" in output or "1 image files unchanged" in output:
+                    # Second pass: drop the managed tags this image did not have
+                    # before, which -j= cannot express (it only writes values).
+                    to_delete = _managed_tags_to_delete(backup_data[0])
+                    if to_delete:
+                        run_exiftool_with_args_file(
+                            to_delete + ["-overwrite_original", str(img_path)],
+                            timeout=timeout,
+                        )
                     logger.info(f"Restored: {img_name}")
                     restored_count += 1
-                elif f"No SourceFile '{img_path}' in imported JSON database" in result.stdout:
+                elif "in imported JSON database" in output:
                     logger.error(f"Restore failed for {img_name}: SourceFile mismatch")
                 else:
                     logger.warning(
                         f"Unexpected ExifTool output restoring {img_name}: "
-                        f"{result.stdout.strip() or '(empty)'}"
+                        f"{output.strip() or '(empty)'}"
                     )
             finally:
                 try:
@@ -791,17 +926,41 @@ def print_dry_run_table(changes: List[Tuple[Path, str, str, str, str]]) -> None:
                 new_val,
                 desc,
             )
-        console.print(table)
-    else:
-        print("\n### Dry-run: Detected changes\n")
-        print("| File | Field | Current | New | Description |")
-        print("|------|-------|---------|-----|-------------|")
-        for img_path, field, current, new_val, desc in changes:
-            print(
-                f"| {img_path.name} | {field.lstrip('-')} | "
-                f"{current or '(empty)'} | {new_val} | {desc} |"
+        try:
+            console.print(table)
+            return
+        except UnicodeEncodeError:
+            # Belt and braces: stdout is normally reconfigured to UTF-8 at import,
+            # but a console that still cannot encode a CJK filename must not take
+            # the whole run down with it - fall through to the ASCII-safe table.
+            logger.warning(
+                "Console cannot render some characters; falling back to a plain table."
             )
-        print()
+
+    _print_plain_table(changes)
+
+
+def _ascii_safe(text: str) -> str:
+    """Best-effort rendering for consoles that cannot encode the real text."""
+    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+    return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+
+
+def _print_plain_table(changes: List[Tuple[Path, str, str, str, str]]) -> None:
+    """Markdown fallback table, safe on any console encoding."""
+    print("\n### Dry-run: Detected changes\n")
+    print("| File | Field | Current | New | Description |")
+    print("|------|-------|---------|-----|-------------|")
+    for img_path, field, current, new_val, desc in changes:
+        row = (
+            f"| {img_path.name} | {field.lstrip('-')} | "
+            f"{current or '(empty)'} | {new_val} | {desc} |"
+        )
+        try:
+            print(row)
+        except UnicodeEncodeError:
+            print(_ascii_safe(row))
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -853,10 +1012,11 @@ def process_folder(
         logger.info(f"date_precision: {date_precision} (not written to EXIF)")
 
     if cleanup_xmp_dtd and metadata.get("scan_date"):
-        logger.warning(
-            "cleanup_xmp_dtd is redundant for this folder because scan_date is set in the YAML; "
-            "the scan_date rewrite will overwrite XMP DateTimeDigitized. "
-            "This is expected behavior for recursive mixed folders."
+        logger.info(
+            "cleanup_xmp_dtd has no effect on this folder: scan_date is set, so "
+            "XMP DateTimeDigitized is rewritten with the scan date instead of being "
+            "deleted. This is expected when running --cleanup-xmp-dtd --recursive "
+            "over mixed folders."
         )
 
     all_changes: List[Tuple[Path, str, str, str, str]] = []
@@ -1147,7 +1307,16 @@ def main() -> None:
                 )
                 metadata.pop(date_field, None)
 
-        modified, failed = process_folder(folder, metadata, threshold, args.apply, args.workers, args.timeout, args.dedup_mode, args.cleanup_xmp_dtd)
+        # One bad folder must not abort the remaining folders of a batch.
+        try:
+            modified, failed = process_folder(
+                folder, metadata, threshold, args.apply, args.workers,
+                args.timeout, args.dedup_mode, args.cleanup_xmp_dtd,
+            )
+        except Exception as exc:
+            logger.exception(f"Unexpected error processing {folder}: {exc}")
+            total_failed += 1
+            continue
         total_modified += modified
         total_failed += failed
 

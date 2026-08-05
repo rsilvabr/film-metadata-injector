@@ -2,7 +2,7 @@
 
 CLI tool that injects analog film metadata—read from `film-metadata.yaml` or `film-metadata.ini` files—directly into the EXIF/IPTC/XMP of scanned photos (JPEG/TIFF).
 
-> **Note on restore:** The built-in restore is a **merge-overwrite** of the tags captured in the backup, not a complete rollback. Tags created after the backup (by other tools or by this script before a later fix) are not removed. For full archival safety, keep separate full-file backups.
+> **Note on restore:** The built-in restore rolls back every tag this script is allowed to write: tags captured in the backup are put back, and managed tags that the backup does *not* contain are removed (they did not exist before the run). Tags outside that set — written by Lightroom, your scanner software, or anything else — are left untouched. The backup still stores metadata only, not pixels, so for full archival safety keep separate full-file backups.
 
 ## The Problem
 
@@ -59,6 +59,8 @@ scan_date=2024-03-10
 notes=Test shoot at the park
 ```
 
+In INI files, ` ;` starts an inline comment, so wrap a value in quotes if it needs a semicolon: `notes="roll #3 ; half frame"`. A `#` never starts a comment mid-value, because film notes use it constantly (`roll #3`). The menu's metadata wizard quotes automatically when needed.
+
 See the `examples/` folder for ready-to-use templates.
 
 ### YAML vs INI — Which to use?
@@ -98,6 +100,7 @@ This is the most important behavior of the script:
    - If `CreateDate`/`DateTimeDigitized` already exists and is `>= threshold` (a real scan date), **we preserve it** and do not touch it.
 3. If the scanner's `DateTimeOriginal` is `>= threshold`, or if there is no `date` in the YAML: **keep the original** and log an informational message.
 4. If `date` is missing or `date_precision: unknown`: **do not touch** `DateTimeOriginal`.
+5. If `DateTimeOriginal` **already equals** the date in the metadata file, the image is left alone — checked *before* the garbage test. This matters for genuinely old rolls: a roll shot in 1998 is older than the 2015 threshold, so without this rule the date the script itself wrote would be re-classified as scanner garbage on the next run, the roll would never converge, and the real scanner date parked in `CreateDate` would be overwritten.
 
 ### Comprehensive UserComment Format
 
@@ -151,6 +154,41 @@ pip install pyyaml rich
 ```
 
 ## Usage
+
+### Interactive Menu (easiest)
+
+```bash
+python film_metadata_menu.py
+```
+
+A guided wizard in the style of `jxl_photo.py`: numbered menus, step-by-step run configuration, persistent settings, and named presets — no command-line flags to memorize.
+
+```
+╭────────────── Film Metadata Injector - Environment ──────────────╮
+│ [OK] exiftool 13.59 | [OK] pyyaml | [OK] rich                    │
+╰──────────────────────────────────────────────────────────────────╯
+╭───────────────────────────── Main Menu ──────────────────────────╮
+│  1  New run (wizard)                                             │
+│  2  Repeat last run (F:\Scans\Roll_01)                           │
+│  3  Create metadata file for a folder                            │
+│  4  Restore from backup                                          │
+│  5  Edit default settings                                        │
+│  6  Presets (2 saved)                                            │
+│  7  Check dependencies again                                     │
+│  0  Exit                                                         │
+╰──────────────────────────────────────────────────────────────────╯
+```
+
+Highlights:
+
+- **New run** — pick the folder (drag & drop works), options, then it runs a **dry-run first** and asks before applying (type `YES` to write EXIF)
+- **Create metadata file** — field-by-field assistant with common-value hints (cameras, film stocks, dev processes); validates dates/ISO and writes a ready `film-metadata.yaml`/`.ini`. Empty fields are omitted
+- **Repeat last run / Presets** — settings are stored in `.film_metadata_injector_config.json` in your home folder; save recurring jobs under a name
+- **Restore** — guided restore from `.film-metadata-injector-backup/`
+
+The menu is just a wrapper: it builds and runs the same `film_metadata_injector.py` command line shown below, so both can be used interchangeably.
+
+### Command Line
 
 ### Dry-run (default) — always run this first
 
@@ -253,7 +291,14 @@ python film_metadata_injector.py /path/to/folder --restore
 python film_metadata_injector.py /path/to/folder --restore --recursive
 ```
 
-**Note:** Restore is a **merge-overwrite**, not a complete rollback. Tags created after the backup (by other tools or by this script) are not removed. The script rewrites the stored `SourceFile` path internally so restores still work after the folder is renamed or moved.
+**What restore does, exactly.** For each image it runs two passes:
+
+1. Imports the backup JSON, putting back every tag it holds (list tags such as `Keywords` are replaced, not appended).
+2. Deletes the *managed* tags absent from the backup — `Make`, `Model`, `ISO`, `LensModel`, `DateTimeOriginal`, `CreateDate`, `UserComment`, `Keywords`, `XMP-dc:Subject`, `XMP-exif:DateTimeDigitized`. If a tag is missing from the backup it did not exist before the run, so a faithful restore removes it.
+
+Anything outside that list is never deleted, so metadata written by other tools survives. The script rewrites the stored `SourceFile` path internally, so restores still work after the folder is renamed or moved.
+
+Only images that actually had changes get a backup, so `--restore` covers exactly the images the script modified.
 
 > For legacy cleanup of stale `XMP-exif:DateTimeDigitized` values, see `--cleanup-xmp-dtd` below.
 
@@ -272,7 +317,7 @@ done
 
 ### Cleaning up legacy XMP DateTimeDigitized
 
-If you processed files with an older version of this script, they may contain an incorrect `XMP-exif:DateTimeDigitized` value (for example, scanner garbage that was written to XMP but not EXIF). The built-in restore will not remove it because restore is a merge-overwrite.
+If you processed files with an older version of this script, they may contain an incorrect `XMP-exif:DateTimeDigitized` value (for example, scanner garbage that was written to XMP but not EXIF) on images you no longer have a backup for.
 
 To clean it up:
 
@@ -286,7 +331,7 @@ python film_metadata_injector.py /path/to/folder --cleanup-xmp-dtd --apply
 
 This removes the legacy `XMP-exif:DateTimeDigitized` tag from all images in the folder. You usually want to re-run the normal metadata injection afterwards (with `scan_date` in your YAML) so both EXIF and XMP are populated correctly.
 
-> **Note:** If a folder's YAML already contains `scan_date`, `--cleanup-xmp-dtd` is redundant for that folder — the `scan_date` logic already overwrites the XMP tag. The script will emit a warning explaining this, which is normal and expected when running `--cleanup-xmp-dtd --recursive` across mixed folders.
+> **Note:** If a folder's metadata file contains `scan_date`, the cleanup is **skipped** for that folder: `scan_date` owns `XMP-exif:DateTimeDigitized` and writes the real scan date there. The script logs an informational line saying so, which is normal when running `--cleanup-xmp-dtd --recursive` across mixed folders.
 
 ## Supported Formats
 
@@ -301,6 +346,14 @@ Other formats are silently skipped.
 - ExifTool installed and on PATH
 - `pyyaml` (to read `.yaml`)
 - `rich` (optional, for colored dry-run tables)
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+End-to-end regression suite: it writes real JPEG/TIFF files, runs the script as a subprocess, and reads the result back with ExifTool. It covers re-run convergence on pre-threshold rolls, `--cleanup-xmp-dtd` vs. `scan_date`, CJK filenames on a cp1252 console, restore counting and rollback completeness, keyword deduplication, and INI parsing. Tests that need ExifTool skip themselves when it is not on PATH.
 
 ## Example Dry-run Output
 
