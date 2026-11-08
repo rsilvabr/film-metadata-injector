@@ -378,11 +378,15 @@ End-to-end regression suite: it writes real JPEG/TIFF files, runs the script as 
 
 ## Roadmap / Future Ideas
 
-- [ ] Interactive wizard (similar to `convert_tiff.py`)
+- [x] Interactive wizard (`film_metadata_menu.py`)
 - [ ] Hierarchical keywords (`Film>Kodak>Portra 400`)
 - [ ] Metadata inheritance between folders (child inherits from parent)
 - [ ] Lightroom Classic integration (read `.lrcat` catalog)
 - [ ] Support for DNG and other scanner RAW formats
+
+## Version
+
+**v1.0.0** (2026-11-08) — the first release, after seven review rounds; every fix along the way is in [BUGS_FIXED.md](BUGS_FIXED.md).
 
 ## License
 

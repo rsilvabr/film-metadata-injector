@@ -2,7 +2,7 @@
 
 This document tracks all bugs found during code review and how they were fixed.
 
-> **⚠️ IMPORTANT NOTE:** Three bugs documented below as "Fixed" (#8, #9, #16) were **documented but never actually implemented in the code**. They remain active bugs in the current codebase and need to be addressed. See the updated entries below for details.
+> **Note:** Three bugs (#8, #9, #16) were first documented as fixed in Round 1 without the code change; they were actually fixed in Round 3 (commit 8571210). Their entries below keep the original description.
 
 ## Critical Bugs
 
@@ -154,12 +154,11 @@ Each image's EXIF was read twice: once during dry-run analysis, and again during
 
 **Impact:** Double the ExifTool calls. For 100 images, 200 calls instead of 100.
 
-**Status: NOT FIXED IN CODE** ❌
-- The fix was documented here but never implemented in `film_metadata_injector.py`
+**Status: FIXED in Round 3** ✅ (commit 8571210; documented as fixed in Round 1 before the code was changed). What the code did before:
 - `process_folder()` still calls `get_exif_data()` in both the analysis loop (line 572) and the apply phase (lines 540, 611)
 - The results from the first read are never stored or reused
 
-**Planned Fix:**
+**Fix (Round 3):**
 - Store `current_exif` + `commands` in a dictionary during analysis
 - Reuse cached results during apply phase instead of reading EXIF again
 
@@ -174,12 +173,11 @@ Even with `--workers 8`, the dry-run analysis loop ran sequentially. Only the ap
 
 **Impact:** Large rolls (100+ photos) were slow to analyze before applying.
 
-**Status: NOT FIXED IN CODE** ❌
-- The fix was documented here but never implemented in `film_metadata_injector.py`
+**Status: FIXED in Round 3** ✅ (commit 8571210; documented as fixed in Round 1 before the code was changed). What the code did before:
 - The analysis loop (lines 570-577) still uses a plain `for` loop without any ThreadPoolExecutor
 - The comment even admits it: "Dry-run analysis: can be parallel too, but keep it simple"
 
-**Planned Fix:**
+**Fix (Round 3):**
 - Add `ThreadPoolExecutor` to the analysis phase, matching the apply phase pattern
 - Cache EXIF results to avoid double-reading (see Bug #8)
 
@@ -270,11 +268,10 @@ Type checkers couldn't infer that `error_exit()` never returns, causing false wa
 **What it did:**
 `process_folder()` accepted a `recursive` parameter that was never used inside the function. The actual recursion was handled by `discover_folders()` in `main()`.
 
-**Status: NOT FIXED IN CODE** ❌
-- The fix was documented here but never implemented in `film_metadata_injector.py`
+**Status: FIXED in Round 3** ✅ (commit 8571210; documented as fixed in Round 1 before the code was changed). What the code did before:
 - The `recursive` parameter still exists in the function signature and is still passed from `main()`
 
-**Planned Fix:**
+**Fix (Round 3):**
 - Remove the unused `recursive` parameter from `process_folder()` signature
 - Remove `args.recursive` from the call in `main()`
 
